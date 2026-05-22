@@ -32,6 +32,12 @@ func CanRunTailscaleSSH() error {
 			return errors.New("The Tailscale SSH server does not run in sandboxed Tailscale GUI builds.")
 		}
 	case "freebsd", "openbsd", "plan9":
+	case "windows":
+		// The Windows Tailscale SSH server runs by delegating user-side
+		// process execution to the Windows OpenSSH Server (an opt-in
+		// optional component since Windows 10 1809 / Server 2019). We
+		// don't check whether it is installed here; the daemon surfaces
+		// a clearer error at enable-time if it's missing.
 	default:
 		return errors.New("The Tailscale SSH server is not supported on " + runtime.GOOS)
 	}

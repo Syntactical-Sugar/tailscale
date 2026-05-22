@@ -9,6 +9,17 @@ import (
 	"strings"
 )
 
+// acceptEnvPair reports whether the environment variable key=value pair
+// should be accepted from the client. It uses the same default as OpenSSH
+// AcceptEnv.
+func acceptEnvPair(kv string) bool {
+	k, _, ok := strings.Cut(kv, "=")
+	if !ok {
+		return false
+	}
+	return k == "TERM" || k == "LANG" || strings.HasPrefix(k, "LC_")
+}
+
 // filterEnv filters a passed in environ string slice (a slice with strings
 // representing environment variables in the form "key=value") based on
 // the supplied slice of acceptEnv values.

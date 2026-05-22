@@ -1131,16 +1131,6 @@ func updateStringInSlice(ss []string, a, b string) {
 	}
 }
 
-// acceptEnvPair reports whether the environment variable key=value pair
-// should be accepted from the client. It uses the same default as OpenSSH
-// AcceptEnv.
-func acceptEnvPair(kv string) bool {
-	k, _, ok := strings.Cut(kv, "=")
-	if !ok {
-		return false
-	}
-	return k == "TERM" || k == "LANG" || strings.HasPrefix(k, "LC_")
-}
 
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
