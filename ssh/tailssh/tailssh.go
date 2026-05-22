@@ -26,7 +26,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	gliderssh "github.com/tailscale/gliderssh"
@@ -980,7 +979,10 @@ func (ss *sshSession) run() {
 		defer t.Stop()
 	}
 
-	if euid := os.Geteuid(); euid != 0 && runtime.GOOS != "plan9" {
+	// Windows and plan9 don't do user-switching in tailscaled itself, so
+	// the euid check (which guards against the incubator failing to setuid
+	// later) doesn't apply.
+	if euid := os.Geteuid(); euid != 0 && runtime.GOOS != "plan9" && runtime.GOOS != "windows" {
 		if lu.Uid != fmt.Sprint(euid) {
 			ss.logf("can't switch to user %q from process euid %v", lu.Username, euid)
 			fmt.Fprintf(ss, "can't switch user\r\n")
@@ -1061,7 +1063,7 @@ func (ss *sshSession) run() {
 		defer rdStdout.Close()
 		_, err := io.Copy(rec.writer("o", ss), rdStdout)
 		if err != nil && !errors.Is(err, io.EOF) {
-			isErrBecauseProcessExited := processDone.Load() && errors.Is(err, syscall.EIO)
+			isErrBecauseProcessExited := processDone.Load() && isPtyClosedErr(err)
 			if !isErrBecauseProcessExited {
 				logf("stdout copy: %v", err)
 				ss.cancelCtx(err)
