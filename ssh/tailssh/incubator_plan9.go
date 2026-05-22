@@ -341,17 +341,15 @@ func newCommand(cmdPath string, cmdEnviron []string, cmdArgs []string) *exec.Cmd
 
 // launchProcess launches an incubator process for the provided session.
 // It is responsible for configuring the process execution environment.
-// The caller can wait for the process to exit by calling cmd.Wait().
 //
-// It sets ss.cmd, stdin, stdout, and stderr.
+// On return, ss.executor is populated and the user program has been started;
+// the caller waits for it via ss.executor.Wait().
 func (ss *sshSession) launchProcess() error {
-	var err error
-	ss.cmd, err = ss.newIncubatorCommand(ss.logf)
+	cmd, err := ss.newIncubatorCommand(ss.logf)
 	if err != nil {
 		return err
 	}
 
-	cmd := ss.cmd
 	cmd.Dir = "/"
 	cmd.Env = append(os.Environ(), envForUser(ss.conn.localUser)...)
 	for _, kv := range ss.Environ() {
@@ -370,34 +368,48 @@ func (ss *sshSession) launchProcess() error {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("SSH_AUTH_SOCK=%s", ss.agentListener.Addr()))
 	}
 
-	return ss.startWithStdPipes()
+	exec, err := ss.startWithStdPipes(cmd)
+	if err != nil {
+		return err
+	}
+	ss.executor = exec
+	return nil
 }
 
 // startWithStdPipes starts cmd with os.Pipe for Stdin, Stdout and Stderr.
-func (ss *sshSession) startWithStdPipes() (err error) {
+func (ss *sshSession) startWithStdPipes(cmd *exec.Cmd) (e *cmdExecutor, err error) {
+	if cmd == nil {
+		return nil, errors.New("nil cmd")
+	}
 	var rdStdin, wrStdout, wrStderr io.ReadWriteCloser
+	var wrStdin, rdStdout, rdStderr io.ReadWriteCloser
 	defer func() {
 		if err != nil {
-			closeAll(rdStdin, ss.wrStdin, ss.rdStdout, wrStdout, ss.rdStderr, wrStderr)
+			closeAll(rdStdin, wrStdin, rdStdout, wrStdout, rdStderr, wrStderr)
 		}
 	}()
-	if ss.cmd == nil {
-		return errors.New("nil cmd")
+	if rdStdin, wrStdin, err = os.Pipe(); err != nil {
+		return nil, err
 	}
-	if rdStdin, ss.wrStdin, err = os.Pipe(); err != nil {
-		return err
+	if rdStdout, wrStdout, err = os.Pipe(); err != nil {
+		return nil, err
 	}
-	if ss.rdStdout, wrStdout, err = os.Pipe(); err != nil {
-		return err
+	if rdStderr, wrStderr, err = os.Pipe(); err != nil {
+		return nil, err
 	}
-	if ss.rdStderr, wrStderr, err = os.Pipe(); err != nil {
-		return err
+	cmd.Stdin = rdStdin
+	cmd.Stdout = wrStdout
+	cmd.Stderr = wrStderr
+	if err = cmd.Start(); err != nil {
+		return nil, err
 	}
-	ss.cmd.Stdin = rdStdin
-	ss.cmd.Stdout = wrStdout
-	ss.cmd.Stderr = wrStderr
-	ss.childPipes = []io.Closer{rdStdin, wrStdout, wrStderr}
-	return ss.cmd.Start()
+	return &cmdExecutor{
+		cmd:        cmd,
+		stdin:      wrStdin,
+		stdout:     rdStdout,
+		stderr:     rdStderr,
+		childPipes: []io.Closer{rdStdin, wrStdout, wrStderr},
+	}, nil
 }
 
 func envForUser(u *userMeta) []string {

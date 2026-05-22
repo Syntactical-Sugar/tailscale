@@ -20,7 +20,6 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -747,16 +746,8 @@ type sshSession struct {
 	agentListener net.Listener // non-nil if agent-forwarding requested+allowed
 
 	// initialized by launchProcess:
-	cmd      *exec.Cmd
-	wrStdin  io.WriteCloser
-	rdStdout io.ReadCloser
-	rdStderr io.ReadCloser  // rdStderr is nil for pty sessions
+	executor sessionExecutor
 	ptyReq   *gliderssh.Pty // non-nil for pty sessions
-
-	// childPipes is a list of pipes that need to be closed when the process exits.
-	// For pty sessions, this is the tty fd.
-	// For non-pty sessions, this is the stdin, stdout, stderr fds.
-	childPipes []io.Closer
 
 	// We use this sync.Once to ensure that we only terminate the process once,
 	// either it exits itself or is terminated
@@ -879,7 +870,7 @@ func (ss *sshSession) killProcessOnContextDone() {
 		// the waiting regardless of termination reason.
 
 		// TODO(maisem): should this be a SIGTERM followed by a SIGKILL?
-		ss.cmd.Process.Kill()
+		ss.executor.Kill()
 	})
 }
 
@@ -1048,24 +1039,27 @@ func (ss *sshSession) run() {
 	ss.exitHandled = make(chan struct{})
 	go ss.killProcessOnContextDone()
 
+	wrStdin := ss.executor.Stdin()
+	rdStdout := ss.executor.Stdout()
+	rdStderr := ss.executor.Stderr() // nil for ptys
 	var processDone atomic.Bool
 	go func() {
-		defer ss.wrStdin.Close()
-		if _, err := io.Copy(rec.writer("i", ss.wrStdin), ss); err != nil {
+		defer wrStdin.Close()
+		if _, err := io.Copy(rec.writer("i", wrStdin), ss); err != nil {
 			logf("stdin copy: %v", err)
 			ss.cancelCtx(err)
 		}
 	}()
 	outputDone := make(chan struct{})
 	var openOutputStreams atomic.Int32
-	if ss.rdStderr != nil {
+	if rdStderr != nil {
 		openOutputStreams.Store(2)
 	} else {
 		openOutputStreams.Store(1)
 	}
 	go func() {
-		defer ss.rdStdout.Close()
-		_, err := io.Copy(rec.writer("o", ss), ss.rdStdout)
+		defer rdStdout.Close()
+		_, err := io.Copy(rec.writer("o", ss), rdStdout)
 		if err != nil && !errors.Is(err, io.EOF) {
 			isErrBecauseProcessExited := processDone.Load() && errors.Is(err, syscall.EIO)
 			if !isErrBecauseProcessExited {
@@ -1079,10 +1073,10 @@ func (ss *sshSession) run() {
 		}
 	}()
 	// rdStderr is nil for ptys.
-	if ss.rdStderr != nil {
+	if rdStderr != nil {
 		go func() {
-			defer ss.rdStderr.Close()
-			_, err := io.Copy(ss.Stderr(), ss.rdStderr)
+			defer rdStderr.Close()
+			_, err := io.Copy(ss.Stderr(), rdStderr)
 			if err != nil {
 				logf("stderr copy: %v", err)
 			}
@@ -1093,7 +1087,7 @@ func (ss *sshSession) run() {
 		}()
 	}
 
-	err = ss.cmd.Wait()
+	err = ss.executor.Wait()
 	processDone.Store(true)
 
 	if ss.ctx.Err() != nil {
@@ -1113,7 +1107,7 @@ func (ss *sshSession) run() {
 	// Close the process-side of all pipes to signal the asynchronous
 	// io.Copy routines reading/writing from the pipes to terminate.
 	// Block for the io.Copy to finish before calling ss.Exit below.
-	closeAll(ss.childPipes...)
+	closeAll(ss.executor.ChildPipes()...)
 	select {
 	case <-outputDone:
 	case <-ss.ctx.Done():
@@ -1125,8 +1119,8 @@ func (ss *sshSession) run() {
 		ss.Exit(0)
 		return
 	}
-	if ee, ok := err.(*exec.ExitError); ok {
-		code := ee.ProcessState.ExitCode()
+	if ee, ok := err.(interface{ ExitCode() int }); ok {
+		code := ee.ExitCode()
 		ss.logf("Wait: code=%v", code)
 		ss.Exit(code)
 		return

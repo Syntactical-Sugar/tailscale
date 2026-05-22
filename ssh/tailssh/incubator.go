@@ -834,17 +834,15 @@ func doDropPrivileges(dlogf logger.Logf, wantUid, wantGid int, supplementaryGrou
 
 // launchProcess launches an incubator process for the provided session.
 // It is responsible for configuring the process execution environment.
-// The caller can wait for the process to exit by calling cmd.Wait().
 //
-// It sets ss.cmd, stdin, stdout, and stderr.
+// On return, ss.executor is populated and the user program has been started;
+// the caller waits for it via ss.executor.Wait().
 func (ss *sshSession) launchProcess() error {
-	var err error
-	ss.cmd, err = ss.newIncubatorCommand(ss.logf)
+	cmd, err := ss.newIncubatorCommand(ss.logf)
 	if err != nil {
 		return err
 	}
 
-	cmd := ss.cmd
 	cmd.Env = envForUser(ss.conn.localUser)
 	for _, kv := range ss.Environ() {
 		if acceptEnvPair(kv) {
@@ -865,7 +863,12 @@ func (ss *sshSession) launchProcess() error {
 	ptyReq, winCh, isPty := ss.Pty()
 	if !isPty {
 		ss.logf("starting non-pty command: %+v", cmd.Args)
-		return ss.startWithStdPipes()
+		exec, err := ss.startWithStdPipes(cmd)
+		if err != nil {
+			return err
+		}
+		ss.executor = exec
+		return nil
 	}
 
 	if sshDisablePTY() {
@@ -874,7 +877,7 @@ func (ss *sshSession) launchProcess() error {
 	}
 
 	ss.ptyReq = &ptyReq
-	pty, tty, err := ss.startWithPTY()
+	pty, tty, err := ss.startWithPTY(cmd)
 	if err != nil {
 		return err
 	}
@@ -889,11 +892,13 @@ func (ss *sshSession) launchProcess() error {
 	}
 	go resizeWindow(ptyDup /* arbitrary fd */, winCh)
 
-	ss.wrStdin = pty
-	ss.rdStdout = os.NewFile(uintptr(ptyDup), pty.Name())
-	ss.rdStderr = nil // not available for pty
-	ss.childPipes = []io.Closer{tty}
-
+	ss.executor = &cmdExecutor{
+		cmd:        cmd,
+		stdin:      pty,
+		stdout:     os.NewFile(uintptr(ptyDup), pty.Name()),
+		stderr:     nil, // not available for pty
+		childPipes: []io.Closer{tty},
+	}
 	return nil
 }
 
@@ -971,11 +976,10 @@ var opcodeShortName = map[uint8]string{
 }
 
 // startWithPTY starts cmd with a pseudo-terminal attached to Stdin, Stdout and Stderr.
-func (ss *sshSession) startWithPTY() (ptyFile, tty *os.File, err error) {
+func (ss *sshSession) startWithPTY(cmd *exec.Cmd) (ptyFile, tty *os.File, err error) {
 	ptyReq := ss.ptyReq
-	cmd := ss.cmd
 	if cmd == nil {
-		return nil, nil, errors.New("nil ss.cmd")
+		return nil, nil, errors.New("nil cmd")
 	}
 	if ptyReq == nil {
 		return nil, nil, errors.New("nil ss.ptyReq")
@@ -1072,30 +1076,39 @@ func (ss *sshSession) startWithPTY() (ptyFile, tty *os.File, err error) {
 }
 
 // startWithStdPipes starts cmd with os.Pipe for Stdin, Stdout and Stderr.
-func (ss *sshSession) startWithStdPipes() (err error) {
+func (ss *sshSession) startWithStdPipes(cmd *exec.Cmd) (e *cmdExecutor, err error) {
+	if cmd == nil {
+		return nil, errors.New("nil cmd")
+	}
 	var rdStdin, wrStdout, wrStderr io.ReadWriteCloser
+	var wrStdin, rdStdout, rdStderr io.ReadWriteCloser
 	defer func() {
 		if err != nil {
-			closeAll(rdStdin, ss.wrStdin, ss.rdStdout, wrStdout, ss.rdStderr, wrStderr)
+			closeAll(rdStdin, wrStdin, rdStdout, wrStdout, rdStderr, wrStderr)
 		}
 	}()
-	if ss.cmd == nil {
-		return errors.New("nil cmd")
+	if rdStdin, wrStdin, err = os.Pipe(); err != nil {
+		return nil, err
 	}
-	if rdStdin, ss.wrStdin, err = os.Pipe(); err != nil {
-		return err
+	if rdStdout, wrStdout, err = os.Pipe(); err != nil {
+		return nil, err
 	}
-	if ss.rdStdout, wrStdout, err = os.Pipe(); err != nil {
-		return err
+	if rdStderr, wrStderr, err = os.Pipe(); err != nil {
+		return nil, err
 	}
-	if ss.rdStderr, wrStderr, err = os.Pipe(); err != nil {
-		return err
+	cmd.Stdin = rdStdin
+	cmd.Stdout = wrStdout
+	cmd.Stderr = wrStderr
+	if err = cmd.Start(); err != nil {
+		return nil, err
 	}
-	ss.cmd.Stdin = rdStdin
-	ss.cmd.Stdout = wrStdout
-	ss.cmd.Stderr = wrStderr
-	ss.childPipes = []io.Closer{rdStdin, wrStdout, wrStderr}
-	return ss.cmd.Start()
+	return &cmdExecutor{
+		cmd:        cmd,
+		stdin:      wrStdin,
+		stdout:     rdStdout,
+		stderr:     rdStderr,
+		childPipes: []io.Closer{rdStdin, wrStdout, wrStderr},
+	}, nil
 }
 
 func envForUser(u *userMeta) []string {
