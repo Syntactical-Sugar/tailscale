@@ -111,6 +111,33 @@ func TestDelegationCA_NonPositiveValidity(t *testing.T) {
 	}
 }
 
+func TestDelegationCA_PersistRoundTrip(t *testing.T) {
+	ca, err := newDelegationCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+	priv, err := marshalCAPrivate(ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca2, err := delegationCAFromPrivate(priv)
+	if err != nil {
+		t.Fatalf("delegationCAFromPrivate: %v", err)
+	}
+	if string(ca.signer.PublicKey().Marshal()) != string(ca2.signer.PublicKey().Marshal()) {
+		t.Error("public key changed across round-trip")
+	}
+
+	sig, err := ca2.MintUserCert("alice", 30*time.Second)
+	if err != nil {
+		t.Fatalf("MintUserCert after reload: %v", err)
+	}
+	cert := sig.PublicKey().(*ssh.Certificate)
+	if string(cert.SignatureKey.Marshal()) != string(ca.signer.PublicKey().Marshal()) {
+		t.Error("reloaded CA signed cert with different key than original")
+	}
+}
+
 func TestDelegationCA_PublicKey(t *testing.T) {
 	ca, err := newDelegationCA()
 	if err != nil {

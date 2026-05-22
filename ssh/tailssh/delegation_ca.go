@@ -8,7 +8,9 @@ package tailssh
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"time"
@@ -25,7 +27,8 @@ import (
 //
 // The CA is also useful in tests as a self-contained ssh-cert minter.
 type delegationCA struct {
-	signer ssh.Signer // signs certificates with the CA's private key
+	signer  ssh.Signer // signs certificates with the CA's private key
+	privPEM []byte     // PKCS#8 PEM encoding of the private key, for persistence
 }
 
 // newDelegationCA generates a fresh Ed25519 SSH CA keypair.
@@ -38,14 +41,18 @@ func newDelegationCA() (*delegationCA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("delegationCA: signer: %w", err)
 	}
-	return &delegationCA{signer: signer}, nil
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return nil, fmt.Errorf("delegationCA: marshal: %w", err)
+	}
+	privPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	return &delegationCA{signer: signer, privPEM: privPEM}, nil
 }
 
-// delegationCAFromPrivate constructs a delegationCA from a previously
-// generated private key in OpenSSH PEM format. Used to reload a persisted
-// CA at tailscaled startup.
-func delegationCAFromPrivate(pem []byte) (*delegationCA, error) {
-	k, err := ssh.ParseRawPrivateKey(pem)
+// delegationCAFromPrivate reconstructs a delegationCA from a previously
+// persisted PKCS#8 PEM private key. Used at tailscaled startup.
+func delegationCAFromPrivate(privPEM []byte) (*delegationCA, error) {
+	k, err := ssh.ParseRawPrivateKey(privPEM)
 	if err != nil {
 		return nil, fmt.Errorf("delegationCA: parse private: %w", err)
 	}
@@ -53,7 +60,16 @@ func delegationCAFromPrivate(pem []byte) (*delegationCA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("delegationCA: signer: %w", err)
 	}
-	return &delegationCA{signer: signer}, nil
+	return &delegationCA{signer: signer, privPEM: privPEM}, nil
+}
+
+// marshalCAPrivate returns the CA private key in PKCS#8 PEM format,
+// suitable for writing to disk and reloading via delegationCAFromPrivate.
+func marshalCAPrivate(ca *delegationCA) ([]byte, error) {
+	if len(ca.privPEM) == 0 {
+		return nil, errors.New("delegationCA: no private key bytes")
+	}
+	return ca.privPEM, nil
 }
 
 // PublicKey returns the CA's public key in OpenSSH authorized_keys format
