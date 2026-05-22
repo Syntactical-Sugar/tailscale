@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
+//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9 || windows
 
 package tailssh
 
@@ -85,6 +85,11 @@ func getSSHUsernames(b *ipnlocal.LocalBackend, req *tailcfg.C2NSSHUsernamesReque
 			}
 			add(string(line))
 		}
+	case "windows":
+		// On Windows we delegate user-side execution to local OpenSSH, so we
+		// don't have a cheap, portable way to enumerate users here. The
+		// operator user (added above) is enough of a hint; the client will
+		// otherwise prompt the user to type a name.
 	default:
 		for lr := range lineiter.File("/etc/passwd") {
 			line, err := lr.Value()
