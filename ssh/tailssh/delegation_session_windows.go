@@ -250,20 +250,29 @@ func (e *innerExitError) Unwrap() error { return e.inner }
 
 // ensureDelegationCA returns the per-process delegation CA, lazily
 // initialising it (and writing the sshd_config drop-in) on first use.
+//
+// On failure the result is not cached so a subsequent SSH attempt can
+// retry — useful when the user fixes a precondition (e.g. installing
+// OpenSSH Server) without restarting tailscaled.
 var (
-	delegationCAOnce sync.Once
-	delegationCAVal  *delegationCA
-	delegationCAErr  error
+	delegationCAMu  sync.Mutex
+	delegationCAVal *delegationCA
 )
 
 func ensureDelegationCA(srv *server) (*delegationCA, error) {
-	delegationCAOnce.Do(func() {
-		varRoot := srv.lb.TailscaleVarRoot()
-		if varRoot == "" {
-			delegationCAErr = errors.New("no Tailscale var root; cannot persist SSH delegation CA")
-			return
-		}
-		delegationCAVal, delegationCAErr = setUpDelegation(varRoot, srv.logf)
-	})
-	return delegationCAVal, delegationCAErr
+	delegationCAMu.Lock()
+	defer delegationCAMu.Unlock()
+	if delegationCAVal != nil {
+		return delegationCAVal, nil
+	}
+	varRoot := srv.lb.TailscaleVarRoot()
+	if varRoot == "" {
+		return nil, errors.New("no Tailscale var root; cannot persist SSH delegation CA")
+	}
+	ca, err := setUpDelegation(varRoot, srv.logf)
+	if err != nil {
+		return nil, err
+	}
+	delegationCAVal = ca
+	return ca, nil
 }

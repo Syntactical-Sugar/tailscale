@@ -42,6 +42,14 @@ var errOpenSSHNotInstalled = errors.New(
 	"Windows OpenSSH Server is not installed (run: " +
 		`Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0)`)
 
+// errOpenSSHNotInitialized is returned when the sshd service is registered
+// but has not yet been started and so has not materialized
+// %ProgramData%\ssh\sshd_config. We attempt to start it ourselves; this
+// error escapes if that doesn't recover.
+var errOpenSSHNotInitialized = errors.New(
+	"Windows OpenSSH Server is installed but its config directory has " +
+		"not been initialized; tried to start the sshd service")
+
 // programDataSSHDir returns the directory that holds the Windows OpenSSH
 // server configuration (typically C:\ProgramData\ssh).
 func programDataSSHDir() string {
@@ -61,13 +69,29 @@ func setUpDelegation(varRoot string, logf logger.Logf) (*delegationCA, error) {
 	if varRoot == "" {
 		return nil, errors.New("tailssh: empty varRoot")
 	}
+
+	// OpenSSH installation registers the sshd service in the SCM. That's
+	// a stronger signal than the existence of %ProgramData%\ssh\sshd_config,
+	// which only appears after sshd has run at least once.
+	if err := requireSSHDService(); err != nil {
+		return nil, err
+	}
+
 	sshDir := programDataSSHDir()
 	mainConfig := filepath.Join(sshDir, "sshd_config")
 	if _, err := os.Stat(mainConfig); err != nil {
-		if os.IsNotExist(err) {
-			return nil, errOpenSSHNotInstalled
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("stat %s: %w", mainConfig, err)
 		}
-		return nil, fmt.Errorf("stat %s: %w", mainConfig, err)
+		// First-run initialization: start sshd so it creates the
+		// directory and copies sshd_config_default into place.
+		logf("tailssh: %s missing; starting sshd to initialize it", mainConfig)
+		if err := startSSHD(logf); err != nil {
+			return nil, fmt.Errorf("initial sshd start: %w", err)
+		}
+		if _, err := os.Stat(mainConfig); err != nil {
+			return nil, errOpenSSHNotInitialized
+		}
 	}
 
 	ca, err := loadOrCreateCA(varRoot, logf)
@@ -238,6 +262,55 @@ func writeAtomic(path string, data []byte, mode os.FileMode) error {
 	return os.Rename(tmp, path)
 }
 
+// requireSSHDService verifies that the sshd service is registered with
+// the Service Control Manager. It does not check whether the service is
+// running.
+func requireSSHDService() error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return fmt.Errorf("scm connect: %w", err)
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService("sshd")
+	if err != nil {
+		// ERROR_SERVICE_DOES_NOT_EXIST (1060) is what we get when the
+		// OpenSSH Server optional component is not installed.
+		return errOpenSSHNotInstalled
+	}
+	s.Close()
+	return nil
+}
+
+// startSSHD starts the sshd service if it is not already running and
+// waits until it reports Running.
+func startSSHD(logf logger.Logf) error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return fmt.Errorf("scm connect: %w", err)
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService("sshd")
+	if err != nil {
+		return fmt.Errorf("open service sshd: %w", err)
+	}
+	defer s.Close()
+	status, err := s.Query()
+	if err != nil {
+		return fmt.Errorf("query sshd: %w", err)
+	}
+	if status.State == svc.Running {
+		return nil
+	}
+	if err := s.Start(); err != nil {
+		return fmt.Errorf("start sshd: %w", err)
+	}
+	if err := waitForState(s, svc.Running, 30*time.Second); err != nil {
+		return fmt.Errorf("wait for sshd start: %w", err)
+	}
+	logf("tailssh: sshd started")
+	return nil
+}
+
 // restartSSHD stops and starts the local Windows OpenSSH service.
 func restartSSHD(logf logger.Logf) error {
 	m, err := mgr.Connect()
@@ -267,7 +340,7 @@ func restartSSHD(logf logger.Logf) error {
 	if err := s.Start(); err != nil {
 		return fmt.Errorf("start sshd: %w", err)
 	}
-	if err := waitForState(s, svc.Running, 10*time.Second); err != nil {
+	if err := waitForState(s, svc.Running, 30*time.Second); err != nil {
 		return fmt.Errorf("wait for sshd start: %w", err)
 	}
 	logf("tailssh: sshd restarted")
