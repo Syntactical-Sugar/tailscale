@@ -789,7 +789,20 @@ func (c *conn) isStillValid() bool {
 	if !a.Accept && a.HoldAndDelegate == "" {
 		return false
 	}
-	return c.localUser.Username == localUser
+	if c.localUser.Username == localUser {
+		return true
+	}
+	// The policy returned a username that's textually different from
+	// c.localUser.Username — e.g. a case difference, or an unqualified
+	// name where userLookup returned a "DOMAIN\\name" canonical form
+	// (routine on Windows). Resolve the policy-returned name through
+	// userLookup and compare canonical forms.
+	lu, err := userLookup(localUser)
+	if err != nil {
+		c.vlogf("stillValid: userLookup(%q): %v", localUser, err)
+		return false
+	}
+	return c.localUser.Username == lu.Username
 }
 
 // checkStillValid checks that the conn is still valid per the latest SSHPolicy.
