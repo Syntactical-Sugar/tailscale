@@ -66,6 +66,7 @@ func programDataSSHDir() string {
 // On success the returned delegationCA can be used to mint short-lived
 // per-session user certificates.
 func setUpDelegation(varRoot string, logf logger.Logf) (*delegationCA, error) {
+	logf("tailssh-win: setUpDelegation: begin varRoot=%q", varRoot)
 	if varRoot == "" {
 		return nil, errors.New("tailssh: empty varRoot")
 	}
@@ -73,59 +74,87 @@ func setUpDelegation(varRoot string, logf logger.Logf) (*delegationCA, error) {
 	// OpenSSH installation registers the sshd service in the SCM. That's
 	// a stronger signal than the existence of %ProgramData%\ssh\sshd_config,
 	// which only appears after sshd has run at least once.
-	if err := requireSSHDService(); err != nil {
+	logf("tailssh-win: setUpDelegation: checking sshd service registration")
+	if err := requireSSHDService(logf); err != nil {
+		logf("tailssh-win: setUpDelegation: requireSSHDService failed: %v", err)
 		return nil, err
 	}
+	logf("tailssh-win: setUpDelegation: sshd service is registered")
 
 	sshDir := programDataSSHDir()
 	mainConfig := filepath.Join(sshDir, "sshd_config")
+	logf("tailssh-win: setUpDelegation: stat %s", mainConfig)
 	if _, err := os.Stat(mainConfig); err != nil {
 		if !os.IsNotExist(err) {
+			logf("tailssh-win: setUpDelegation: stat error: %v", err)
 			return nil, fmt.Errorf("stat %s: %w", mainConfig, err)
 		}
 		// First-run initialization: start sshd so it creates the
 		// directory and copies sshd_config_default into place.
-		logf("tailssh: %s missing; starting sshd to initialize it", mainConfig)
+		logf("tailssh-win: setUpDelegation: %s missing; starting sshd to initialize it", mainConfig)
 		if err := startSSHD(logf); err != nil {
+			logf("tailssh-win: setUpDelegation: initial sshd start failed: %v", err)
 			return nil, fmt.Errorf("initial sshd start: %w", err)
 		}
 		if _, err := os.Stat(mainConfig); err != nil {
+			logf("tailssh-win: setUpDelegation: %s still missing after start: %v", mainConfig, err)
 			return nil, errOpenSSHNotInitialized
 		}
+		logf("tailssh-win: setUpDelegation: %s materialized after sshd start", mainConfig)
+	} else {
+		logf("tailssh-win: setUpDelegation: %s exists", mainConfig)
 	}
 
+	logf("tailssh-win: setUpDelegation: loading/creating CA")
 	ca, err := loadOrCreateCA(varRoot, logf)
 	if err != nil {
+		logf("tailssh-win: setUpDelegation: loadOrCreateCA failed: %v", err)
 		return nil, fmt.Errorf("CA setup: %w", err)
 	}
 
 	caPubPath := filepath.Join(sshDir, caPublicFileBaseName)
-	if err := writeIfChanged(caPubPath, ca.PublicKey(), 0644); err != nil {
+	logf("tailssh-win: setUpDelegation: writing CA public key to %s", caPubPath)
+	caPubChanged, err := writeIfChangedReport(caPubPath, ca.PublicKey(), 0644)
+	if err != nil {
+		logf("tailssh-win: setUpDelegation: write CA public key failed: %v", err)
 		return nil, fmt.Errorf("write CA public key: %w", err)
 	}
+	logf("tailssh-win: setUpDelegation: CA public key changed=%v", caPubChanged)
 
 	dropInDir := filepath.Join(sshDir, "sshd_config.d")
+	logf("tailssh-win: setUpDelegation: ensure dropInDir=%s", dropInDir)
 	if err := os.MkdirAll(dropInDir, 0755); err != nil {
+		logf("tailssh-win: setUpDelegation: mkdir %s failed: %v", dropInDir, err)
 		return nil, fmt.Errorf("mkdir %s: %w", dropInDir, err)
 	}
 	dropInPath := filepath.Join(dropInDir, dropInFileName)
 	dropInBody := dropInConfig(caPubPath)
+	logf("tailssh-win: setUpDelegation: writing drop-in %s (%d bytes)", dropInPath, len(dropInBody))
 	dropInChanged, err := writeIfChangedReport(dropInPath, dropInBody, 0644)
 	if err != nil {
+		logf("tailssh-win: setUpDelegation: write drop-in failed: %v", err)
 		return nil, fmt.Errorf("write drop-in: %w", err)
 	}
+	logf("tailssh-win: setUpDelegation: drop-in changed=%v", dropInChanged)
 
-	includeChanged, err := ensureIncludeDirective(mainConfig)
+	logf("tailssh-win: setUpDelegation: ensuring Include directive in %s", mainConfig)
+	includeChanged, err := ensureIncludeDirective(mainConfig, logf)
 	if err != nil {
+		logf("tailssh-win: setUpDelegation: ensureIncludeDirective failed: %v", err)
 		return nil, fmt.Errorf("ensure Include: %w", err)
 	}
+	logf("tailssh-win: setUpDelegation: include directive changed=%v", includeChanged)
 
-	if dropInChanged || includeChanged {
-		logf("tailssh: sshd config changed (drop-in=%v include=%v); restarting sshd", dropInChanged, includeChanged)
+	if dropInChanged || includeChanged || caPubChanged {
+		logf("tailssh-win: setUpDelegation: sshd config changed (drop-in=%v include=%v ca-pub=%v); restarting sshd", dropInChanged, includeChanged, caPubChanged)
 		if err := restartSSHD(logf); err != nil {
+			logf("tailssh-win: setUpDelegation: restartSSHD failed: %v", err)
 			return nil, fmt.Errorf("restart sshd: %w", err)
 		}
+	} else {
+		logf("tailssh-win: setUpDelegation: no config changes; sshd restart skipped")
 	}
+	logf("tailssh-win: setUpDelegation: done")
 	return ca, nil
 }
 
@@ -133,27 +162,41 @@ func setUpDelegation(varRoot string, logf logger.Logf) (*delegationCA, error) {
 // and persists a new one if absent.
 func loadOrCreateCA(varRoot string, logf logger.Logf) (*delegationCA, error) {
 	dir := filepath.Join(varRoot, "ssh")
+	logf("tailssh-win: loadOrCreateCA: ensuring dir %s", dir)
 	if err := os.MkdirAll(dir, 0700); err != nil {
+		logf("tailssh-win: loadOrCreateCA: mkdir failed: %v", err)
 		return nil, err
 	}
 	path := filepath.Join(dir, caPrivateFileName)
+	logf("tailssh-win: loadOrCreateCA: try read existing CA at %s", path)
 	if b, err := os.ReadFile(path); err == nil {
-		return delegationCAFromPrivate(b)
+		logf("tailssh-win: loadOrCreateCA: found existing CA (%d bytes); reusing", len(b))
+		ca, err := delegationCAFromPrivate(b)
+		if err != nil {
+			logf("tailssh-win: loadOrCreateCA: parse existing CA failed: %v", err)
+		}
+		return ca, err
 	} else if !os.IsNotExist(err) {
+		logf("tailssh-win: loadOrCreateCA: read CA error: %v", err)
 		return nil, err
 	}
-	logf("tailssh: generating new delegation CA")
+	logf("tailssh-win: loadOrCreateCA: no existing CA; generating new one")
 	ca, err := newDelegationCA()
 	if err != nil {
+		logf("tailssh-win: loadOrCreateCA: newDelegationCA failed: %v", err)
 		return nil, err
 	}
 	priv, err := marshalCAPrivate(ca)
 	if err != nil {
+		logf("tailssh-win: loadOrCreateCA: marshal failed: %v", err)
 		return nil, err
 	}
+	logf("tailssh-win: loadOrCreateCA: writing CA private key to %s", path)
 	if err := os.WriteFile(path, priv, 0600); err != nil {
+		logf("tailssh-win: loadOrCreateCA: write failed: %v", err)
 		return nil, err
 	}
+	logf("tailssh-win: loadOrCreateCA: new CA persisted")
 	return ca, nil
 }
 
@@ -175,19 +218,24 @@ func dropInConfig(caPubPath string) []byte {
 // kept idempotent across runs. Existing manual Include directives (without
 // our markers) are also respected — if any Include of "sshd_config.d/*.conf"
 // or "sshd_config.d\*.conf" is already present we leave the file alone.
-func ensureIncludeDirective(mainConfig string) (changed bool, err error) {
+func ensureIncludeDirective(mainConfig string, logf logger.Logf) (changed bool, err error) {
 	body, err := os.ReadFile(mainConfig)
 	if err != nil {
+		logf("tailssh-win: ensureIncludeDirective: read failed: %v", err)
 		return false, err
 	}
+	logf("tailssh-win: ensureIncludeDirective: read %d bytes", len(body))
 	if hasIncludeDirective(body) {
+		logf("tailssh-win: ensureIncludeDirective: Include already present; not modifying")
 		return false, nil
 	}
+	logf("tailssh-win: ensureIncludeDirective: no Include found; appending managed block")
 	block := "\n" + tailscaleBeginMarker + "\n" +
 		"Include sshd_config.d\\*.conf\n" +
 		tailscaleEndMarker + "\n"
 	out := append(append([]byte(nil), body...), []byte(block)...)
 	if err := writeAtomic(mainConfig, out, 0644); err != nil {
+		logf("tailssh-win: ensureIncludeDirective: write failed: %v", err)
 		return false, err
 	}
 	return true, nil
@@ -223,13 +271,9 @@ func hasIncludeDirective(body []byte) bool {
 	return false
 }
 
-// writeIfChanged writes data to path with mode iff the existing contents
-// differ. Used to keep file mtimes stable when nothing has changed.
-func writeIfChanged(path string, data []byte, mode os.FileMode) error {
-	_, err := writeIfChangedReport(path, data, mode)
-	return err
-}
-
+// writeIfChangedReport writes data to path with mode iff the existing
+// contents differ. It returns whether the file was actually written.
+// Used to keep mtimes stable and to drive the "restart sshd" decision.
 func writeIfChangedReport(path string, data []byte, mode os.FileMode) (changed bool, err error) {
 	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, data) {
 		return false, nil
@@ -265,25 +309,30 @@ func writeAtomic(path string, data []byte, mode os.FileMode) error {
 // requireSSHDService verifies that the sshd service is registered with
 // the Service Control Manager. It does not check whether the service is
 // running.
-func requireSSHDService() error {
+func requireSSHDService(logf logger.Logf) error {
+	logf("tailssh-win: requireSSHDService: connecting to SCM")
 	m, err := mgr.Connect()
 	if err != nil {
+		logf("tailssh-win: requireSSHDService: scm connect failed: %v", err)
 		return fmt.Errorf("scm connect: %w", err)
 	}
 	defer m.Disconnect()
 	s, err := m.OpenService("sshd")
 	if err != nil {
+		logf("tailssh-win: requireSSHDService: OpenService(sshd) failed: %v", err)
 		// ERROR_SERVICE_DOES_NOT_EXIST (1060) is what we get when the
 		// OpenSSH Server optional component is not installed.
 		return errOpenSSHNotInstalled
 	}
 	s.Close()
+	logf("tailssh-win: requireSSHDService: sshd service registered")
 	return nil
 }
 
 // startSSHD starts the sshd service if it is not already running and
 // waits until it reports Running.
 func startSSHD(logf logger.Logf) error {
+	logf("tailssh-win: startSSHD: connecting to SCM")
 	m, err := mgr.Connect()
 	if err != nil {
 		return fmt.Errorf("scm connect: %w", err)
@@ -298,21 +347,27 @@ func startSSHD(logf logger.Logf) error {
 	if err != nil {
 		return fmt.Errorf("query sshd: %w", err)
 	}
+	logf("tailssh-win: startSSHD: current state=%v", status.State)
 	if status.State == svc.Running {
+		logf("tailssh-win: startSSHD: already running; nothing to do")
 		return nil
 	}
+	logf("tailssh-win: startSSHD: issuing Start")
 	if err := s.Start(); err != nil {
+		logf("tailssh-win: startSSHD: Start failed: %v", err)
 		return fmt.Errorf("start sshd: %w", err)
 	}
 	if err := waitForState(s, svc.Running, 30*time.Second); err != nil {
+		logf("tailssh-win: startSSHD: wait Running failed: %v", err)
 		return fmt.Errorf("wait for sshd start: %w", err)
 	}
-	logf("tailssh: sshd started")
+	logf("tailssh-win: startSSHD: sshd started")
 	return nil
 }
 
 // restartSSHD stops and starts the local Windows OpenSSH service.
 func restartSSHD(logf logger.Logf) error {
+	logf("tailssh-win: restartSSHD: connecting to SCM")
 	m, err := mgr.Connect()
 	if err != nil {
 		return fmt.Errorf("scm connect: %w", err)
@@ -329,21 +384,29 @@ func restartSSHD(logf logger.Logf) error {
 	if err != nil {
 		return fmt.Errorf("query sshd: %w", err)
 	}
+	logf("tailssh-win: restartSSHD: current state=%v", status.State)
 	if status.State != svc.Stopped {
+		logf("tailssh-win: restartSSHD: issuing Stop")
 		if _, err := s.Control(svc.Stop); err != nil {
+			logf("tailssh-win: restartSSHD: Stop failed: %v", err)
 			return fmt.Errorf("stop sshd: %w", err)
 		}
 		if err := waitForState(s, svc.Stopped, 10*time.Second); err != nil {
+			logf("tailssh-win: restartSSHD: wait Stopped failed: %v", err)
 			return fmt.Errorf("wait for sshd stop: %w", err)
 		}
+		logf("tailssh-win: restartSSHD: stopped")
 	}
+	logf("tailssh-win: restartSSHD: issuing Start")
 	if err := s.Start(); err != nil {
+		logf("tailssh-win: restartSSHD: Start failed: %v", err)
 		return fmt.Errorf("start sshd: %w", err)
 	}
 	if err := waitForState(s, svc.Running, 30*time.Second); err != nil {
+		logf("tailssh-win: restartSSHD: wait Running failed: %v", err)
 		return fmt.Errorf("wait for sshd start: %w", err)
 	}
-	logf("tailssh: sshd restarted")
+	logf("tailssh-win: restartSSHD: sshd restarted")
 	return nil
 }
 

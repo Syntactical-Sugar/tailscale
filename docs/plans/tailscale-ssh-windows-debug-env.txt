@@ -1,0 +1,8 @@
+# Drop this file into C:\ProgramData\Tailscale\tailscaled-env.txt
+# and restart the Tailscale service. Lines are KEY=VALUE; '#' is a comment.
+
+# Verbose SSH server logging (ss.vlogf / c.vlogf calls in ssh/tailssh).
+TS_DEBUG_SSH_VLOG=1
+
+# Record SSH session I/O to disk under the var root for offline inspection.
+TS_DEBUG_LOG_SSH=1
