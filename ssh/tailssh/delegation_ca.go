@@ -121,8 +121,16 @@ func (ca *delegationCA) MintUserCert(principal string, validity time.Duration) (
 		ValidAfter:  uint64(now.Add(-5 * time.Second).Unix()),
 		ValidBefore: uint64(now.Add(validity).Unix()),
 		Permissions: ssh.Permissions{
-			// We dial loopback only; no need for source-address
-			// restrictions, but no extensions either — minimal cert.
+			// Same default extensions that `ssh-keygen -s` puts on
+			// user certs. Without these sshd denies pty allocation,
+			// agent forwarding, port forwarding, etc.
+			Extensions: map[string]string{
+				"permit-pty":              "",
+				"permit-X11-forwarding":   "",
+				"permit-agent-forwarding": "",
+				"permit-port-forwarding":  "",
+				"permit-user-rc":          "",
+			},
 		},
 	}
 	if err := cert.SignCert(rand.Reader, ca.signer); err != nil {

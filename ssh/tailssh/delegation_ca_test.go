@@ -64,6 +64,32 @@ func TestDelegationCA_MintUserCert(t *testing.T) {
 	}
 }
 
+func TestDelegationCA_PermitExtensions(t *testing.T) {
+	// Without the permit-pty extension OpenSSH refuses pty-req with
+	// "Allocating a pty not permitted for this connection." Make sure
+	// every minted cert carries the standard set.
+	ca, err := newDelegationCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := ca.MintUserCert("alice", 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := sig.PublicKey().(*ssh.Certificate)
+	for _, ext := range []string{
+		"permit-pty",
+		"permit-X11-forwarding",
+		"permit-agent-forwarding",
+		"permit-port-forwarding",
+		"permit-user-rc",
+	} {
+		if _, ok := cert.Permissions.Extensions[ext]; !ok {
+			t.Errorf("cert missing extension %q; have %v", ext, cert.Permissions.Extensions)
+		}
+	}
+}
+
 func TestDelegationCA_SignatureKey(t *testing.T) {
 	// Two CAs with different keys produce certificates whose SignatureKey
 	// fields point at each respective CA. Authority checks (e.g. in
