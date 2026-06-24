@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fork branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: tailscale-ssh-windows
           fetch-depth: 0
