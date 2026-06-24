@@ -43,7 +43,15 @@ func (ss *sshSession) launchProcess() error {
 	}
 	ss.logf("tailssh-win: launchProcess: cert minted for principal=%q", principal)
 
-	client, err := dialLocalSSHD(principal, signer, ss.logf)
+	// Relay a Windows-password second factor only on PTY sessions; inert unless sshd demands password auth.
+	var promptPassword func() (string, error)
+	if _, _, isPty := ss.Pty(); isPty {
+		promptPassword = func() (string, error) {
+			return readOuterSecret(ss, fmt.Sprintf("Windows password for %s: ", principal))
+		}
+	}
+
+	client, err := dialLocalSSHD(principal, signer, promptPassword, ss.logf)
 	if err != nil {
 		ss.logf("tailssh-win: launchProcess: dialLocalSSHD failed: %v", err)
 		return fmt.Errorf("dial local sshd: %w", err)
@@ -180,7 +188,7 @@ func startInnerSession(session *ssh.Session, ss *sshSession) error {
 // The host key callback is permissive: the connection target is the
 // loopback adapter on the same machine, so MITM is not a meaningful
 // threat. The traffic never leaves the host.
-func dialLocalSSHD(user string, signer ssh.Signer, logf func(string, ...any)) (*ssh.Client, error) {
+func dialLocalSSHD(user string, signer ssh.Signer, promptPassword func() (string, error), logf func(string, ...any)) (*ssh.Client, error) {
 	const addr = "127.0.0.1:22"
 	logf("tailssh-win: dialLocalSSHD: dialing %s as user=%q", addr, user)
 	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
@@ -189,9 +197,14 @@ func dialLocalSSHD(user string, signer ssh.Signer, logf func(string, ...any)) (*
 		return nil, err
 	}
 	logf("tailssh-win: dialLocalSSHD: TCP connected; starting SSH handshake")
+	auth := []ssh.AuthMethod{ssh.PublicKeys(signer)}
+	if promptPassword != nil {
+		// Second factor, used only when sshd requires publickey,password.
+		auth = append(auth, ssh.RetryableAuthMethod(ssh.PasswordCallback(promptPassword), 3))
+	}
 	cfg := &ssh.ClientConfig{
 		User:            user,
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		Auth:            auth,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         10 * time.Second,
 	}
@@ -203,6 +216,41 @@ func dialLocalSSHD(user string, signer ssh.Signer, logf func(string, ...any)) (*
 	}
 	logf("tailssh-win: dialLocalSSHD: SSH handshake ok")
 	return ssh.NewClient(c, chans, reqs), nil
+}
+
+// readOuterSecret prompts the outer (tailnet) SSH client for a secret over the
+// session channel and reads a single line without echoing it. It collects the
+// Windows account password for the inner sshd's second authentication factor.
+// It requires an interactive (PTY) outer session; the caller gates on that.
+func readOuterSecret(ss *sshSession, prompt string) (string, error) {
+	if _, err := io.WriteString(ss, prompt); err != nil {
+		return "", fmt.Errorf("write password prompt: %w", err)
+	}
+	var buf []byte
+	b := make([]byte, 1)
+	for {
+		n, err := ss.Read(b)
+		if err != nil {
+			return "", fmt.Errorf("read password: %w", err)
+		}
+		if n == 0 {
+			continue
+		}
+		switch c := b[0]; c {
+		case '\r', '\n':
+			io.WriteString(ss, "\r\n")
+			return string(buf), nil
+		case 0x7f, 0x08: // DEL / BS
+			if len(buf) > 0 {
+				buf = buf[:len(buf)-1]
+			}
+		case 0x03: // Ctrl-C
+			io.WriteString(ss, "\r\n")
+			return "", errors.New("password entry aborted")
+		default:
+			buf = append(buf, c)
+		}
+	}
 }
 
 // forwardWindowChanges forwards window-size changes from the outer client
