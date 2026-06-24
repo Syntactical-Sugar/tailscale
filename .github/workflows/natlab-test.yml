@@ -53,7 +53,7 @@ jobs:
       # SHAs), so it survives across workflow runs and is invalidated only
       # when a new image source is added.
       - name: Cache cloud VM images
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: ~/.cache/tailscale/vmtest/images
           key: natlab-vmimages-${{ hashFiles('tstest/natlab/vmtest/images.go') }}
@@ -64,7 +64,7 @@ jobs:
       # also get the cache.
       - name: Cache gokrazy VM image
         id: gokrazy-cache
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: gokrazy/natlabapp.qcow2
           key: natlab-gokrazy-${{ github.sha }}
@@ -153,13 +153,13 @@ jobs:
       # strict for the gokrazy cache (e.g. a non-fatal cache eviction
       # between prepare and us); we just rebuild on miss instead.
       - name: Restore cloud VM images
-        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache/restore@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: ~/.cache/tailscale/vmtest/images
           key: natlab-vmimages-${{ hashFiles('tstest/natlab/vmtest/images.go') }}
 
       - name: Restore gokrazy VM image
-        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache/restore@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: gokrazy/natlabapp.qcow2
           key: natlab-gokrazy-${{ github.sha }}
