@@ -1,0 +1,45 @@
+# Nightly merge of official tailscale/tailscale main into this fork's
+# tailscale-ssh-windows branch, preserving passcod's and our changes.
+# Merge (not rebase) keeps local commits and the dependabot opt-out.
+# On conflict the job fails and nothing is pushed; resolve locally.
+name: Nightly upstream sync
+
+on:
+  schedule:
+    - cron: '23 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork branch
+        uses: actions/checkout@v4
+        with:
+          ref: tailscale-ssh-windows
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/tailscale/tailscale.git
+
+      - name: Fetch upstream
+        run: git fetch --tags upstream main
+
+      - name: Merge upstream
+        run: git merge --no-edit upstream/main
+
+      - name: Push merged result
+        run: git push origin HEAD:tailscale-ssh-windows
