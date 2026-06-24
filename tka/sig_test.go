@@ -152,7 +152,7 @@ func TestSigNested_DeepNesting(t *testing.T) {
 
 	outer := nestedSig
 	var lastNodeKey key.NodePrivate
-	for range 15 { // 15 = max nesting level for CBOR
+	for range cborDecOpts.MaxNestedLevels - 1 {
 		lastNodeKey = key.NewNode()
 		nodeKeyPub, _ := lastNodeKey.Public().MarshalBinary()
 
@@ -303,7 +303,7 @@ func TestSigSerializeUnserialize(t *testing.T) {
 }
 
 func TestNodeKeySignatureRotationDetails(t *testing.T) {
-	// Trusted network lock key
+	// Trusted tailnet lock key
 	pub, priv := testingKey25519(t, 1)
 	k := Key{Kind: Key25519, Public: pub, Votes: 2}
 

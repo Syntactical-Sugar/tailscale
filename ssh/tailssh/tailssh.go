@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -37,6 +38,7 @@ import (
 	"tailscale.com/net/tsdial"
 	"tailscale.com/sessionrecording"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
@@ -60,6 +62,8 @@ var (
 	// hookSSHLoginSuccess is called after successful SSH authentication.
 	// It is set by platform-specific code (e.g., auditd_linux.go).
 	hookSSHLoginSuccess feature.Hook[func(logf logger.Logf, c *conn)]
+
+	uidRegex = regexp.MustCompile("^[0-9]+$")
 )
 
 const (
@@ -338,6 +342,10 @@ func (c *conn) clientAuth(cm ssh.ConnMetadata) (perms *ssh.Permissions, retErr e
 		return &ssh.Permissions{}, nil
 	}
 
+	if uidRegex.MatchString(cm.User()) {
+		return nil, c.errBanner(fmt.Sprintf("rejecting username %q. Usernames that consist of only digits are not allowed as they are ambiguous with numerical UIDs", cm.User()), nil)
+	}
+
 	if err := c.setInfo(cm); err != nil {
 		return nil, c.errBanner("failed to get connection info", err)
 	}
@@ -477,7 +485,7 @@ func (srv *server) newConn() (*conn, error) {
 	srv.mu.Unlock()
 	c := &conn{srv: srv}
 	now := srv.now()
-	c.connID = fmt.Sprintf("ssh-conn-%s-%02x", now.UTC().Format("20060102T150405"), randBytes(5))
+	c.connID = fmt.Sprintf("ssh-conn-%s-%02x", now.UTC().Format(tstime.BasicDateTTime), randBytes(5))
 	fwdHandler := &gliderssh.ForwardedTCPHandler{}
 	streamLocalFwdHandler := &gliderssh.ForwardedUnixHandler{}
 	c.Server = &gliderssh.Server{
@@ -766,7 +774,7 @@ func (ss *sshSession) vlogf(format string, args ...any) {
 }
 
 func (c *conn) newSSHSession(s gliderssh.Session) *sshSession {
-	sharedID := fmt.Sprintf("sess-%s-%02x", c.srv.now().UTC().Format("20060102T150405"), randBytes(5))
+	sharedID := fmt.Sprintf("sess-%s-%02x", c.srv.now().UTC().Format(tstime.BasicDateTTime), randBytes(5))
 	c.logf("starting session: %v", sharedID)
 	ctx, cancel := context.WithCancelCause(s.Context())
 	return &sshSession{

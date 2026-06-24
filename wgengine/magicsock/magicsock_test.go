@@ -39,6 +39,9 @@ import (
 	"go4.org/mem"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+	extwgconn "golang.zx2c4.com/wireguard/conn"
+	extwgdevice "golang.zx2c4.com/wireguard/device"
+	extwgtest "golang.zx2c4.com/wireguard/tun/tuntest"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/derp/derpserver"
 	"tailscale.com/disco"
@@ -213,7 +216,7 @@ func newMagicStackWithKey(t testing.TB, logf logger.Logf, ln nettype.PacketListe
 	tsTun.SetFilter(filter.NewAllowAllForTest(logf))
 	tsTun.Start()
 
-	wgLogger := wglog.NewLogger(logf)
+	wgLogger := wglog.NewLogger(logf, nil)
 	dev := wgcfg.NewDevice(tsTun, conn.Bind(), wgLogger.DeviceLogger)
 	dev.Up()
 
@@ -241,7 +244,6 @@ func newMagicStackWithKey(t testing.TB, logf logger.Logf, ln nettype.PacketListe
 
 func (s *magicStack) Reconfig(cfg *wgcfg.Config) error {
 	s.tsTun.SetWGConfig(cfg)
-	s.wgLogger.SetPeers(cfg.Peers)
 
 	// In production, LocalBackend installs a PeerByIPPacketFunc via
 	// Engine.SetPeerByIPPacketFunc. Tests that bypass LocalBackend need
@@ -489,6 +491,62 @@ collectEndpoints:
 	}
 }
 
+// TestResetNetInfoLast verifies that ResetNetInfoLast clears the NetInfo
+// de-duplication cache, so the next NetInfo is delivered to the callback even
+// when it's structurally unchanged (which callNetInfoCallback would normally
+// suppress). This is what lets a node re-advertise its home DERP
+// (NetInfo.PreferredDERP) to a freshly-installed control client after an
+// interactive login or profile switch; without it, peers can't reach the node
+// over DERP until some unrelated NetInfo field changes.
+func TestResetNetInfoLast(t *testing.T) {
+	tstest.PanicOnLog()
+
+	c := newConn(t.Logf)
+
+	got := make(chan *tailcfg.NetInfo, 8)
+	c.SetNetInfoCallback(func(ni *tailcfg.NetInfo) {
+		got <- ni
+	})
+
+	wantCall := func(why string, wantDERP int) {
+		t.Helper()
+		select {
+		case ni := <-got:
+			if ni.PreferredDERP != wantDERP {
+				t.Fatalf("%s: got PreferredDERP=%d, want %d", why, ni.PreferredDERP, wantDERP)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: timed out waiting for NetInfo callback", why)
+		}
+	}
+	wantNoCall := func(why string) {
+		t.Helper()
+		select {
+		case ni := <-got:
+			t.Fatalf("%s: unexpected NetInfo callback: %+v", why, ni)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+
+	ni := &tailcfg.NetInfo{PreferredDERP: 7, WorkingUDP: "true", LinkType: "wired"}
+
+	// First delivery fires the callback.
+	c.callNetInfoCallback(ni.Clone())
+	wantCall("initial", 7)
+
+	// An identical NetInfo is de-duplicated: no callback. This is exactly the
+	// behavior that, on a control-client swap, drops the home DERP.
+	c.callNetInfoCallback(ni.Clone())
+	wantNoCall("duplicate suppressed")
+
+	// Simulate a new control client being installed: clearing the de-dup cache
+	// must let the next (otherwise-identical) NetInfo through, modeling the
+	// post-login netcheck that re-reports derp-7 to the new session.
+	c.ResetNetInfoLast()
+	c.callNetInfoCallback(ni.Clone())
+	wantCall("after ResetNetInfoLast", 7)
+}
+
 func TestPickDERPFallback(t *testing.T) {
 	tstest.PanicOnLog()
 	tstest.ResourceCheck(t)
@@ -628,7 +686,7 @@ func TestDeviceStartStop(t *testing.T) {
 	defer conn.Close()
 
 	tun := tuntest.NewChannelTUN()
-	wgLogger := wglog.NewLogger(t.Logf)
+	wgLogger := wglog.NewLogger(t.Logf, nil)
 	dev := wgcfg.NewDevice(tun.TUN(), conn.Bind(), wgLogger.DeviceLogger)
 	dev.Up()
 	dev.Close()
@@ -2242,8 +2300,8 @@ func TestRebindingUDPConn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer realConn.Close()
-	c.setConnLocked(realConn.(nettype.PacketConn), "udp4", 1)
-	c.setConnLocked(newBlockForeverConn(), "", 1)
+	c.setConnLocked(realConn.(nettype.PacketConn), "udp4", 1, nil)
+	c.setConnLocked(newBlockForeverConn(), "", 1, nil)
 }
 
 // https://github.com/tailscale/tailscale/issues/6680: don't ignore
@@ -2267,17 +2325,20 @@ func TestSetNetworkMapWithNoPeers(t *testing.T) {
 }
 
 // newWireguard starts up a new wireguard-go device attached to a test tun, and
-// returns the device, tun and endpoint port. To add peers call device.IpcSet with UAPI instructions.
-func newWireguard(t *testing.T, uapi string, aips []netip.Prefix) (*device.Device, *tuntest.ChannelTUN, uint16) {
-	wgtun := tuntest.NewChannelTUN()
+// returns the device, tun and endpoint port. To add peers call device.IpcSet
+// with UAPI instructions.
+//
+// This uses stock wireguard-go to simulate a non-Tailscale peer.
+func newWireguard(t *testing.T, uapi string, aips []netip.Prefix) (*extwgdevice.Device, *extwgtest.ChannelTUN, uint16) {
+	wgtun := extwgtest.NewChannelTUN()
 	wglogf := func(f string, args ...any) {
 		t.Logf("wg-go: "+f, args...)
 	}
-	wglog := device.Logger{
+	wglog := extwgdevice.Logger{
 		Verbosef: func(string, ...any) {},
 		Errorf:   wglogf,
 	}
-	wgdev := wgcfg.NewDevice(wgtun.TUN(), wgconn.NewDefaultBind(), &wglog)
+	wgdev := extwgdevice.NewDevice(wgtun.TUN(), extwgconn.NewDefaultBind(), &wglog)
 
 	if err := wgdev.IpcSet(uapi); err != nil {
 		t.Fatal(err)
@@ -4453,6 +4514,10 @@ func TestSendingTSMPDiscoTimer(t *testing.T) {
 	tw := eventbustest.NewWatcher(t, conn.eventBus)
 	t.Cleanup(func() { conn.Close() })
 
+	// maybeSendTSMPDiscoAdvert only advertises when netmap caching is enabled.
+	conn.controlKnobs = new(controlknobs.Knobs)
+	conn.controlKnobs.CacheNetworkMaps.Store(true)
+
 	peerKey := key.NewNode().Public()
 	ep := &endpoint{
 		nodeID:    1,
@@ -4512,5 +4577,104 @@ func TestSendingTSMPDiscoTimer(t *testing.T) {
 	conn.maybeSendTSMPDiscoAdvert(ep)
 	if err := eventbustest.ExpectExactly(tw, eventbustest.Type[NewDiscoKeyAvailable]()); err != nil {
 		t.Errorf("expected only one event, got: %s", err)
+	}
+}
+
+// TestSendingTSMPDiscoCachingDisabled verifies that maybeSendTSMPDiscoAdvert
+// early-returns (sends no advert) when netmap caching is not enabled via the
+// CacheNetworkMaps control knob, including when no knobs are present at all.
+func TestSendingTSMPDiscoCachingDisabled(t *testing.T) {
+	tests := []struct {
+		name  string
+		knobs *controlknobs.Knobs
+	}{
+		{name: "no-knobs", knobs: nil},
+		// Knobs present but CacheNetworkMaps left at its false default.
+		{name: "caching-disabled", knobs: new(controlknobs.Knobs)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conn := newTestConn(t)
+			t.Cleanup(func() { conn.Close() })
+			conn.controlKnobs = tt.knobs
+
+			ep := &endpoint{
+				nodeID:    1,
+				publicKey: key.NewNode().Public(),
+				nodeAddr:  netip.MustParseAddr("100.64.0.1"),
+			}
+			ep.c = conn
+
+			// A fresh endpoint with a zero lastDiscoKeyAdvertisement and no
+			// direct bestAddr would otherwise advertise; the only thing
+			// suppressing it here is the disabled caching knob. On early
+			// return the timestamp is left untouched (zero).
+			conn.maybeSendTSMPDiscoAdvert(ep)
+
+			ep.mu.Lock()
+			defer ep.mu.Unlock()
+			if !ep.lastDiscoKeyAdvertisement.IsZero() {
+				t.Errorf("lastDiscoKeyAdvertisement = %v; want zero (advert should have been suppressed)", ep.lastDiscoKeyAdvertisement)
+			}
+		})
+	}
+}
+
+// TestSendingTSMPDiscoPeerRelaySuppressed verifies that maybeSendTSMPDiscoAdvert
+// suppresses the advert when the bestAddr is a peer relay path (a non-zero
+// addrQuality whose epAddr has a VNI set), even though such a path is not
+// direct. Suppression is observed via lastDiscoKeyAdvertisement remaining
+// unchanged, since a fired advert would overwrite it with the current time.
+func TestSendingTSMPDiscoPeerRelaySuppressed(t *testing.T) {
+	conn := newTestConn(t)
+	t.Cleanup(func() { conn.Close() })
+
+	// maybeSendTSMPDiscoAdvert only advertises when netmap caching is enabled.
+	conn.controlKnobs = new(controlknobs.Knobs)
+	conn.controlKnobs.CacheNetworkMaps.Store(true)
+
+	peerKey := key.NewNode().Public()
+	ep := &endpoint{
+		nodeID:    1,
+		publicKey: peerKey,
+		nodeAddr:  netip.MustParseAddr("100.64.0.1"),
+	}
+	discoKey := key.NewDisco().Public()
+	ep.disco.Store(&endpointDisco{
+		key:   discoKey,
+		short: discoKey.ShortString(),
+	})
+	ep.c = conn
+	conn.mu.Lock()
+	nodeView := (&tailcfg.Node{
+		Key: ep.publicKey,
+		Addresses: []netip.Prefix{
+			netip.MustParsePrefix("100.64.0.1/32"),
+		},
+	}).View()
+	conn.peersByID = map[tailcfg.NodeID]tailcfg.NodeView{nodeView.ID(): nodeView}
+	conn.mu.Unlock()
+
+	conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
+
+	// A peer relay bestAddr: an epAddr with a VNI set. It is past the
+	// rate-limit interval with a non-zero lastDiscoKeyAdvertisement, so the
+	// only thing suppressing the advert is the active (non-zero) bestAddr.
+	var vni packet.VirtualNetworkID
+	vni.Set(7)
+	lastAdvert := mono.Now().Add(-discoKeyAdvertisementInterval - time.Second)
+	ep.mu.Lock()
+	ep.lastDiscoKeyAdvertisement = lastAdvert
+	ep.bestAddr = addrQuality{epAddr: epAddr{ap: netip.MustParseAddrPort("1.2.3.4:567"), vni: vni}}
+	ep.mu.Unlock()
+
+	conn.maybeSendTSMPDiscoAdvert(ep)
+
+	// A fired advert would have overwritten lastDiscoKeyAdvertisement with the
+	// current time; confirm it was left untouched, indicating suppression.
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+	if ep.lastDiscoKeyAdvertisement != lastAdvert {
+		t.Errorf("lastDiscoKeyAdvertisement = %v; want unchanged %v (advert should have been suppressed)", ep.lastDiscoKeyAdvertisement, lastAdvert)
 	}
 }

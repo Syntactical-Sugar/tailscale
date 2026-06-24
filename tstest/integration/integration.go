@@ -919,6 +919,20 @@ func (n *TestNode) MustDown() {
 	if err := n.Tailscale("down", "--accept-risk=all").Run(); err != nil {
 		t.Fatalf("down: %v", err)
 	}
+
+	// The tailscale down command is asynchronous, so it returns early.
+	// Wait for tailscaled to drop its connection before continuing.
+	if err := tstest.WaitFor(time.Second, func() error {
+		if err := t.Context().Err(); err != nil {
+			return err
+		}
+		if c := n.env.Control.InServeMap(); c != 0 {
+			return fmt.Errorf("%d connections remaining in serve map", c)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("tailscale down: %v", err)
+	}
 }
 
 func (n *TestNode) MustLogOut() {
@@ -1116,7 +1130,7 @@ func (n *TestNode) PublicKey() string {
 	return st.Self.PublicKey
 }
 
-// NLPublicKey returns the hex-encoded network lock public key of
+// NLPublicKey returns the hex-encoded tailnet lock public key of
 // this node, e.g. `tlpub:123456abc`
 func (n *TestNode) NLPublicKey() string {
 	tb := n.env.t

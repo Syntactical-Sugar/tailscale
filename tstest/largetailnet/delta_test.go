@@ -57,7 +57,6 @@ func metricByName(t testing.TB, name string) *clientmetric.Metric {
 // [tstest/largetailnet/BenchmarkGiantTailnet], which only measures cost
 // of the same fast path — this test verifies correctness.
 func TestNetmapDeltaFastPath(t *testing.T) {
-	tstest.Shard(t)
 
 	logf := logger.Discard
 	if testing.Verbose() {
@@ -105,22 +104,22 @@ func TestNetmapDeltaFastPath(t *testing.T) {
 	// Snapshot baseline metric values; we'll assert deltas against
 	// these. Globals make per-test isolation impossible, but deltas
 	// are robust against interleaving (assuming no other test runs in
-	// parallel here, hence tstest.Shard above).
+	// parallel here).
 	mFast := metricByName(t, "controlclient_map_response_handled_incrementally")
 	mFull := metricByName(t, "controlclient_map_response_handled_full_rebuild")
-	mAdd := metricByName(t, "localbackend_netmap_delta_peer_added")
+	mUpsert := metricByName(t, "localbackend_netmap_delta_peer_upserted")
 	mRem := metricByName(t, "localbackend_netmap_delta_peer_removed")
 	mPatch := metricByName(t, "localbackend_netmap_delta_peer_patched")
 	mFilter := metricByName(t, "localbackend_update_packet_filter")
 	mUsers := metricByName(t, "localbackend_update_user_profiles")
 	baseline := map[*clientmetric.Metric]int64{
 		mFast: mFast.Value(), mFull: mFull.Value(),
-		mAdd: mAdd.Value(), mRem: mRem.Value(), mPatch: mPatch.Value(),
+		mUpsert: mUpsert.Value(), mRem: mRem.Value(), mPatch: mPatch.Value(),
 		mFilter: mFilter.Value(), mUsers: mUsers.Value(),
 	}
 	dumpMetrics := func(t *testing.T) {
 		t.Helper()
-		for _, m := range []*clientmetric.Metric{mFast, mFull, mAdd, mRem, mPatch, mFilter, mUsers} {
+		for _, m := range []*clientmetric.Metric{mFast, mFull, mUpsert, mRem, mPatch, mFilter, mUsers} {
 			t.Logf("metric %s = %d (baseline %d, delta %d)", m.Name(), m.Value(), baseline[m], m.Value()-baseline[m])
 		}
 	}
@@ -188,7 +187,7 @@ func TestNetmapDeltaFastPath(t *testing.T) {
 		})
 
 		waitDelta(t, mFast, 1)
-		waitDelta(t, mAdd, 1)
+		waitDelta(t, mUpsert, 1)
 		waitDelta(t, mFilter, 1)
 		waitDelta(t, mUsers, 1)
 		waitDelta(t, mFull, 0)

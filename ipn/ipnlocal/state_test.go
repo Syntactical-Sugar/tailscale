@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,6 +47,7 @@ import (
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/magicsock"
+	"tailscale.com/wgengine/netlog"
 	"tailscale.com/wgengine/router"
 	"tailscale.com/wgengine/wgcfg"
 	"tailscale.com/wgengine/wgint"
@@ -1245,7 +1247,7 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 	}{
 		{
 			name: "Initial",
-			// The configs are nil until the the LocalBackend is started.
+			// The configs are nil until the LocalBackend is started.
 			wantState:     ipn.NoState,
 			wantCfg:       nil,
 			wantRouterCfg: nil,
@@ -1571,6 +1573,48 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEngineReconfigOnPeerRouteDelta(t *testing.T) {
+	connect := &ipn.MaskedPrefs{Prefs: ipn.Prefs{WantRunning: true}, WantRunningSet: true}
+	peerAddr := netip.MustParsePrefix("100.64.1.1/32")
+	vipAddr := netip.MustParsePrefix("100.99.99.99/32")
+
+	peer := makePeer(1, withName("node-1"), withAddresses(peerAddr))
+	peerStruct := peer.AsStruct()
+	peerStruct.AllowedIPs = []netip.Prefix{peerAddr}
+	peer = peerStruct.View()
+
+	nm := buildNetmapWithPeers(
+		makePeer(2, withName("node-2"), withAddresses(netip.MustParsePrefix("100.64.1.2/32"))),
+		peer,
+	)
+
+	lb, engine, cc := newLocalBackendWithMockEngineAndControl(t, false)
+	mustDo(t)(lb.Start(ipn.Options{}))
+	mustDo2(t)(lb.EditPrefs(connect))
+	cc().authenticated(nm)
+
+	replacement := nm.Peers[0].AsStruct()
+	replacement.AllowedIPs = append(replacement.AllowedIPs, vipAddr)
+	if !lb.UpdateNetmapDelta([]netmap.NodeMutation{netmap.NodeMutationUpsert{Node: replacement.View()}}) {
+		t.Fatal("UpdateNetmapDelta = false, want true")
+	}
+
+	cfg := engine.Config()
+	if cfg == nil {
+		t.Fatal("engine config is nil")
+	}
+	for _, peer := range cfg.Peers {
+		if peer.PublicKey != replacement.Key {
+			continue
+		}
+		if !slices.Contains(peer.AllowedIPs, vipAddr) {
+			t.Fatalf("peer AllowedIPs = %v; want %v", peer.AllowedIPs, vipAddr)
+		}
+		return
+	}
+	t.Fatalf("engine config missing peer %v", replacement.Key.ShortString())
 }
 
 // TestSendPreservesAuthURL tests that wgengine updates arriving in the middle of
@@ -1939,6 +1983,15 @@ func (e *mockEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, size int, cb
 func (e *mockEngine) InstallCaptureHook(packet.CaptureCallback) {}
 
 func (e *mockEngine) SetPeerByIPPacketFunc(func(netip.Addr) (_ key.NodePublic, ok bool)) {}
+func (e *mockEngine) SetPeerForIPFunc(func(netip.Addr) (_ wgengine.PeerForIP, ok bool))  {}
+func (e *mockEngine) PeerKeyForIP(netip.Addr) (_ key.NodePublic, _ netip.Prefix, ok bool) {
+	return key.NodePublic{}, netip.Prefix{}, false
+}
+func (e *mockEngine) SetPeerSessionStateFunc(func(key.NodePublic, wgengine.PeerWireGuardState)) {
+}
+func (e *mockEngine) SetNetLogNodeSource(netlog.NodeSource)                            {}
+func (e *mockEngine) SetWGPeerLookup(func(wgString string) (tsString string, ok bool)) {}
+func (e *mockEngine) ProbeLocks()                                                      {}
 
 func (e *mockEngine) Close() {
 	e.mu.Lock()

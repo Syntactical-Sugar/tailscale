@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -89,9 +90,11 @@ type Env struct {
 
 	qemuProcs []*exec.Cmd // launched QEMU processes
 
-	sameTailnetUser bool // all nodes register as the same Tailnet user
-	allOnline       bool // mark every peer as Online=true in MapResponses
-	peerRelayGrants bool // grant peer-relay capabilities on the wildcard packet filter
+	sameTailnetUser           bool // all nodes register as the same Tailnet user
+	allOnline                 bool // mark every peer as Online=true in MapResponses
+	peerRelayGrants           bool // grant peer-relay capabilities on the wildcard packet filter
+	selfSignedDERPCertPinning bool // serve test DERP map with sha256-raw cert pins
+	fakeACME                  bool // point tailscaled at vnet's fake ACME server
 
 	// Shared resource initialization (sync.Once for things multiple nodes share).
 	vnetOnce      sync.Once
@@ -384,10 +387,34 @@ func PeerRelayGrants() EnvOption {
 	return envOptFunc(func(e *Env) { e.peerRelayGrants = true })
 }
 
+// SelfSignedDERPCertPinning returns an [EnvOption] that makes the test control
+// server advertise a DERP map whose nodes use CertName="sha256-raw:<hex>"
+// pinning against the self-signed certs vnet's fake DERP servers serve. This
+// exercises the sha256-raw verification path end-to-end (in tailscaled and in
+// `tailscale debug derp`) without involving a real CA.
+func SelfSignedDERPCertPinning() EnvOption {
+	return envOptFunc(func(e *Env) { e.selfSignedDERPCertPinning = true })
+}
+
+// FakeACME returns an [EnvOption] that points nodes at vnet's in-process ACME
+// CA and configures the test control server to advertise MagicDNS cert domains.
+func FakeACME() EnvOption {
+	return envOptFunc(func(e *Env) { e.fakeACME = true })
+}
+
 // AddNetwork creates a new virtual network. Arguments follow the same pattern as
 // vnet.Config.AddNetwork (string IPs, NAT types, NetworkService values).
 func (e *Env) AddNetwork(opts ...any) *vnet.Network {
 	return e.cfg.AddNetwork(opts...)
+}
+
+// RegisterFile registers a file with the vnet fileserver.
+// It is served at http://files.tailscale/<path>.
+func (e *Env) RegisterFile(path string, data []byte) {
+	if e.server == nil {
+		e.t.Fatalf("RegisterFile called before Start")
+	}
+	e.server.RegisterFile(path, data)
 }
 
 // Node represents a virtual machine in the test environment.
@@ -443,6 +470,12 @@ func (e *Env) AddNode(name string, opts ...any) *Node {
 			// Pass through to vnet (TailscaledEnv, NodeOption, MAC, etc.)
 			vnetOpts = append(vnetOpts, o)
 		}
+	}
+	if e.fakeACME {
+		vnetOpts = append(vnetOpts, vnet.TailscaledEnv{
+			Key:   "TS_DEBUG_ACME_DIRECTORY_URL",
+			Value: "http://acme.example/directory",
+		})
 	}
 
 	// macOS VMs require a macOS arm64 host (Apple Virtualization.framework via
@@ -791,6 +824,12 @@ func (e *Env) ControlServer() *testcontrol.Server {
 	return e.server.ControlServer()
 }
 
+// FakeACMERootPEM returns the root certificate for vnet's fake ACME CA.
+func (e *Env) FakeACMERootPEM() []byte {
+	e.initVnet()
+	return e.server.FakeACMERootPEM()
+}
+
 // BringUpMullvadWGServer brings up a userspace WireGuard server on n,
 // configured as a single-peer "Mullvad-style" exit-node target. The
 // server runs inside n's TTA process on a Linux TUN named "wg0".
@@ -1128,6 +1167,68 @@ func (e *Env) RotateDiscoKey(n *Node) {
 	}
 }
 
+// ForcePreferredDERP pins n's home DERP to the given region via the
+// "force-prefer-derp" debug action, so its reported NetInfo.PreferredDERP is
+// deterministic. The force lives on the long-lived magicsock.Conn and so
+// persists across an in-process profile switch. It fatals the test on error.
+func (e *Env) ForcePreferredDERP(n *Node, region int) {
+	e.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	b, err := json.Marshal(region)
+	if err != nil {
+		e.t.Fatalf("ForcePreferredDERP(%s): %v", n.name, err)
+	}
+	if err := n.agent.DebugActionBody(ctx, "force-prefer-derp", bytes.NewReader(b)); err != nil {
+		e.t.Fatalf("ForcePreferredDERP(%s, %d): %v", n.name, region, err)
+	}
+}
+
+// Relogin switches n to a fresh login profile on the same test control server,
+// in-process (no daemon restart), so it comes up under a NEW node identity while
+// keeping the same long-lived magicsock.Conn. This is the control-client swap
+// that an interactive login or profile switch performs, and is what the
+// home-DERP re-report fix guards (see [magicsock.Conn.ResetNetInfoLast]).
+//
+// It switches to an empty profile (the in-process control-client swap the
+// LocalAPI PUT /profiles/ performs) and then logs back in with "tailscale up",
+// which both points the new control client at the test control and drives
+// registration to completion. It waits for the node to return to Running and
+// fatals the test on error.
+func (e *Env) Relogin(n *Node) {
+	e.t.Helper()
+	// Generous timeout: the profile switch triggers a fresh registration +
+	// netcheck + DERP connect, which is slow under TCG (no KVM).
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	// Switch to a fresh, empty login profile. This runs the in-process control-
+	// client swap (resetForProfileChangeLocked -> setControlClientLocked) that
+	// clears the home-DERP dedup cache under test, while preserving the existing
+	// magicsock.Conn (and any forced home DERP from [Env.ForcePreferredDERP]).
+	if err := n.agent.SwitchToEmptyProfile(ctx); err != nil {
+		e.t.Fatalf("Relogin(%s): SwitchToEmptyProfile: %v", n.name, err)
+	}
+	// Log back in to the same test control. "tailscale up --login-server" points
+	// the new control client at the test control and drives registration to
+	// completion (testcontrol auto-authorizes), the same path Env.Start uses.
+	if err := e.tailscaleUp(ctx, n); err != nil {
+		e.t.Fatalf("Relogin(%s): up: %v", n.name, err)
+	}
+	if err := tstest.WaitFor(60*time.Second, func() error {
+		st, err := n.agent.Status(ctx)
+		if err != nil {
+			return err
+		}
+		if st.BackendState != "Running" {
+			return fmt.Errorf("backend state = %q, want Running", st.BackendState)
+		}
+		return nil
+	}); err != nil {
+		e.t.Fatalf("Relogin(%s): %v", n.name, err)
+	}
+}
+
 // RestartTailscaled signals tailscaled on n to die so that its supervisor
 // (gokrazy) restarts it. It then waits for tailscaled to come back to the
 // "Running" backend state. It fatals the test on error.
@@ -1202,20 +1303,42 @@ func (e *Env) AddRoute(n *Node, prefix, via string) {
 // SSHExec runs a command on a cloud VM via its debug SSH NIC.
 // Only works for cloud VMs that have the debug NIC and SSH key configured.
 // Returns stdout and any error.
+//
+// SSH transport-level errors (exit code 255: connection refused, auth
+// failure, etc.) are retried for up to ~30s to absorb the race window
+// between Env.Start() returning (when tta reports the tailscale backend
+// as Running) and cloud-init finishing the user/SSH-key setup. The remote
+// command's own non-zero exit codes are returned to the caller without
+// retry.
 func (e *Env) SSHExec(n *Node, cmd string) (string, error) {
 	if n.sshPort == 0 {
 		return "", fmt.Errorf("node %s has no SSH debug port", n.name)
 	}
-	sshCmd := exec.Command("ssh",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ConnectTimeout=5",
-		"-i", "/tmp/vmtest_key",
-		"-p", fmt.Sprintf("%d", n.sshPort),
-		"root@127.0.0.1",
-		cmd)
-	out, err := sshCmd.CombinedOutput()
-	return string(out), err
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		sshCmd := exec.Command("ssh",
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null",
+			"-o", "BatchMode=yes",
+			"-o", "ConnectTimeout=5",
+			"-o", "LogLevel=ERROR",
+			"-i", "/tmp/vmtest_key",
+			"-p", fmt.Sprintf("%d", n.sshPort),
+			"root@127.0.0.1",
+			cmd)
+		out, err := sshCmd.CombinedOutput()
+		if err == nil {
+			return string(out), nil
+		}
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 255 {
+			return string(out), err
+		}
+		if time.Now().After(deadline) {
+			return string(out), err
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 // DumpStatus logs the tailscale status of a node, including its peers and their
@@ -1312,6 +1435,50 @@ func (e *Env) HTTPGet(from *Node, targetURL string) string {
 	return ""
 }
 
+// Tailscale runs the tailscale CLI on the given node via TTA.
+func (e *Env) Tailscale(n *Node, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	q := url.Values{}
+	for _, arg := range args {
+		q.Add("arg", arg)
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://unused/tailscale?"+q.Encode(), nil)
+	if err != nil {
+		return "", err
+	}
+	res, err := n.agent.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusOK {
+		return string(body), fmt.Errorf("tailscale %q: %s: %s", args, res.Status, res.Header.Get("Exec-Err"))
+	}
+	return string(body), nil
+}
+
+// GokrazyRoot returns the kernel root= argument from a Gokrazy node.
+func (e *Env) GokrazyRoot(n *Node) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://unused/gokrazy-root", nil)
+	if err != nil {
+		return "", err
+	}
+	res, err := n.agent.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("gokrazy-root: %s: %s", res.Status, strings.TrimSpace(string(body)))
+	}
+	return strings.TrimSpace(string(body)), nil
+}
+
 // setNodeScreenshot stores the latest screenshot data URI for a node.
 func (e *Env) setNodeScreenshot(name, dataURI string) {
 	e.nodeStatusMu.Lock()
@@ -1379,7 +1546,50 @@ func (e *Env) initVnet() {
 		if e.peerRelayGrants {
 			e.server.ControlServer().PeerRelayGrants = true
 		}
+		if e.selfSignedDERPCertPinning {
+			e.server.ControlServer().DERPMap = e.buildSelfSignedDERPMap()
+		}
+		if e.fakeACME {
+			cs := e.server.ControlServer()
+			cs.MagicDNSDomain = "tailnet.test"
+			if cs.DNSConfig == nil {
+				cs.DNSConfig = new(tailcfg.DNSConfig)
+			}
+			cs.DNSConfig.Proxied = true
+		}
 	})
+}
+
+// buildSelfSignedDERPMap returns a DERP map identical in structure to the
+// stock test map (same regions, hostnames, virtual IPs) but with each node's
+// CertName set to "sha256-raw:<hex>" pinning the actual self-signed cert
+// served by vnet's fake DERP server, and InsecureForTests cleared so the
+// pin is actually exercised. Nodes are matched to certs by HostName.
+func (e *Env) buildSelfSignedDERPMap() *tailcfg.DERPMap {
+	hostToHash := make(map[string]string, 2)
+	for i := range 2 {
+		hostToHash[e.server.DERPHostname(i)] = e.server.DERPCertSHA256Hex(i)
+	}
+	src := e.server.ControlServer().DERPMap
+	dm := &tailcfg.DERPMap{
+		Regions: make(map[int]*tailcfg.DERPRegion, len(src.Regions)),
+	}
+	for id, srcRegion := range src.Regions {
+		r := *srcRegion
+		r.Nodes = make([]*tailcfg.DERPNode, len(srcRegion.Nodes))
+		for i, srcNode := range srcRegion.Nodes {
+			n := *srcNode
+			hash, ok := hostToHash[n.HostName]
+			if !ok {
+				e.t.Fatalf("buildSelfSignedDERPMap: no cert hash for HostName %q", n.HostName)
+			}
+			n.InsecureForTests = false
+			n.CertName = "sha256-raw:" + hash
+			r.Nodes[i] = &n
+		}
+		dm.Regions[id] = &r
+	}
+	return dm
 }
 
 // ensureQEMUSocket creates the Unix stream socket for QEMU VMs. Called once.

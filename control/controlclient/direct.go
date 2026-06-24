@@ -43,6 +43,7 @@ import (
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/netutil"
 	"tailscale.com/net/netx"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tsdial"
@@ -228,9 +229,9 @@ type NetmapUpdater interface {
 // rather than just full updates.
 type NetmapDeltaUpdater interface {
 	// UpdateNetmapDelta is called with discrete changes to the network map.
-	// The mutation slice may contain [netmap.NodeMutationAdd] and
-	// [netmap.NodeMutationRemove] entries when peers were added or removed,
-	// alongside per-field patches.
+	// The mutation slice may contain [netmap.NodeMutationUpsert] entries when
+	// peers are inserted or replaced, and [netmap.NodeMutationRemove] entries
+	// when peers are removed, alongside per-field patches.
 	//
 	// The ok result is whether the implementation was able to apply the
 	// mutations. It might return false if its internal state doesn't
@@ -347,7 +348,7 @@ func NewDirect(opts Options) (*Direct, error) {
 	}
 	var interceptedDial *atomic.Bool
 	if httpc == nil {
-		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr := netutil.NewDefaultTransport()
 		if buildfeatures.HasUseProxy {
 			tr.Proxy = feature.HookProxyFromEnvironment.GetOrNil()
 			if f, ok := feature.HookProxySetTransportGetProxyConnectHeader.GetOk(); ok {

@@ -20,6 +20,17 @@ func acceptEnvPair(kv string) bool {
 	return k == "TERM" || k == "LANG" || strings.HasPrefix(k, "LC_")
 }
 
+// isDangerousEnvVar reports whether the given environment variable name
+// is unconditionally prohibited from being forwarded, regardless of
+// acceptEnv policy. This prevents privilege escalation via dynamic
+// linker environment variables (e.g. LD_PRELOAD, LD_LIBRARY_PATH,
+// DYLD_INSERT_LIBRARIES) even when a wildcard acceptEnv pattern like
+// "*" is configured.
+func isDangerousEnvVar(name string) bool {
+	upper := strings.ToUpper(name)
+	return strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_")
+}
+
 // filterEnv filters a passed in environ string slice (a slice with strings
 // representing environment variables in the form "key=value") based on
 // the supplied slice of acceptEnv values.
@@ -29,6 +40,10 @@ func acceptEnvPair(kv string) bool {
 //
 // acceptEnv values may contain * and ? wildcard characters which match against
 // zero or one or more characters and a single character respectively.
+//
+// Certain dangerous environment variables (such as those controlling the
+// dynamic linker) are always rejected regardless of the acceptEnv policy.
+// See isDangerousEnvVar.
 func filterEnv(acceptEnv []string, environ []string) ([]string, error) {
 	var acceptedPairs []string
 
@@ -41,6 +56,12 @@ func filterEnv(acceptEnv []string, environ []string) ([]string, error) {
 		variableName, _, ok := strings.Cut(envPair, "=")
 		if !ok {
 			return nil, fmt.Errorf(`invalid environment variable: %q. Variables must be in "KEY=VALUE" format`, envPair)
+		}
+
+		// Always reject dangerous environment variables that could
+		// enable privilege escalation, regardless of acceptEnv policy.
+		if isDangerousEnvVar(variableName) {
+			continue
 		}
 
 		// Short circuit if we have a direct match between the environment

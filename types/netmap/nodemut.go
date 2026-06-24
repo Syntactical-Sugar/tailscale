@@ -68,15 +68,17 @@ func (m NodeMutationLastSeen) Apply(n *tailcfg.Node) {
 	n.LastSeen = new(m.LastSeen)
 }
 
-// NodeMutationAdd is a NodeMutation that says a new peer has been added.
-// Apply is a no-op: consumers of NodeMutationAdd must type-switch to handle
-// adds by inserting Node into their peer map.
-type NodeMutationAdd struct {
+// NodeMutationUpsert is a NodeMutation that says a peer's full Node value
+// should be inserted or replaced.
+//
+// Apply is a no-op: consumers of NodeMutationUpsert must type-switch to handle
+// upserts by storing Node in their peer map.
+type NodeMutationUpsert struct {
 	Node tailcfg.NodeView
 }
 
-func (m NodeMutationAdd) NodeIDBeingMutated() tailcfg.NodeID { return m.Node.ID() }
-func (m NodeMutationAdd) Apply(*tailcfg.Node)                {}
+func (m NodeMutationUpsert) NodeIDBeingMutated() tailcfg.NodeID { return m.Node.ID() }
+func (m NodeMutationUpsert) Apply(*tailcfg.Node)                {}
 
 // NodeMutationRemove is a NodeMutation that says a peer has been removed.
 // Apply is a no-op: consumers of NodeMutationRemove must type-switch to handle
@@ -86,6 +88,13 @@ type NodeMutationRemove struct {
 }
 
 func (m NodeMutationRemove) Apply(*tailcfg.Node) {}
+
+// MakeNodeMutationRemove returns a NodeMutationRemove that targets nodeID.
+// It is the constructor for NodeMutationRemove for callers outside this
+// package, since the embedded ID field is unexported.
+func MakeNodeMutationRemove(nodeID tailcfg.NodeID) NodeMutationRemove {
+	return NodeMutationRemove{mutatingNodeID(nodeID)}
+}
 
 var peerChangeFields = sync.OnceValue(func() []reflect.StructField {
 	var fields []reflect.StructField
@@ -132,9 +141,11 @@ func NodeMutationsFromPatch(p *tailcfg.PeerChange) (_ []NodeMutation, ok bool) {
 // by res. It returns ok=false if res contains any non-delta field as defined
 // by mapResponseContainsNonPatchFields.
 //
-// Adds and removes (from res.PeersChanged / res.PeersRemoved) are emitted as
-// NodeMutationAdd / NodeMutationRemove entries. Callers must type-switch to
-// handle those alongside field mutations.
+// Upserts and removes (from res.PeersChanged / res.PeersRemoved) are emitted
+// as NodeMutationUpsert / NodeMutationRemove entries. A PeersChanged entry can
+// be either a new peer or a full replacement for an existing peer that couldn't
+// be represented as PeerChangedPatch. Callers must type-switch to handle those
+// alongside field mutations.
 func MutationsFromMapResponse(res *tailcfg.MapResponse, now time.Time) (ret []NodeMutation, ok bool) {
 	if now.IsZero() {
 		now = time.Now()
@@ -149,7 +160,7 @@ func MutationsFromMapResponse(res *tailcfg.MapResponse, now time.Time) (ret []No
 	for _, n := range res.PeersChanged {
 		// Any n still in PeersChanged after patchifyPeersChanged is a
 		// truly-new (or replaced) peer.
-		ret = append(ret, NodeMutationAdd{Node: n.View()})
+		ret = append(ret, NodeMutationUpsert{Node: n.View()})
 	}
 	for _, p := range res.PeersChangedPatch {
 		deltas, ok := NodeMutationsFromPatch(p)
@@ -174,7 +185,7 @@ func MutationsFromMapResponse(res *tailcfg.MapResponse, now time.Time) (ret []No
 
 // mapResponseContainsNonPatchFields reports whether res contains any field
 // that can't be expressed as a per-peer NodeMutation (including the new
-// NodeMutationAdd / NodeMutationRemove variants) or via the sibling narrow
+// NodeMutationUpsert / NodeMutationRemove variants) or via the sibling narrow
 // setter methods on the map-session backend (e.g. UpdatePacketFilter).
 //
 // When this returns true, the caller must fall back to rebuilding and
@@ -182,7 +193,7 @@ func MutationsFromMapResponse(res *tailcfg.MapResponse, now time.Time) (ret []No
 // handled incrementally.
 //
 // PeersChanged, PeersRemoved, and PacketFilter(s) are intentionally not in
-// this list: new/removed peers ride NodeMutationAdd/Remove, packet
+// this list: upserted/removed peers ride NodeMutationUpsert/Remove, packet
 // filter updates are delivered via the backend's UpdatePacketFilter
 // method, and UserProfile updates ride the backend's UpdateUserProfiles
 // method.

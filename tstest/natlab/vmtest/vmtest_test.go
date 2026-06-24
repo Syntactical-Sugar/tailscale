@@ -820,6 +820,98 @@ func checkDiscoRotated(t *testing.T, env *vmtest.Env, a, b, pingFrom, pingTo *vm
 	return newDisco
 }
 
+// TestHomeDERPReportedAfterRelogin is a regression test for the bug where, after
+// an in-process control-client swap (an interactive login or profile switch),
+// magicsock's NetInfo de-dup cache (netInfoLast) survived the swap. Because the
+// post-relogin NetInfo was structurally identical (same PreferredDERP, same NAT
+// shape), it was suppressed as unchanged and never re-reported to the new
+// control session, so control never learned the node's home DERP and peers
+// couldn't reach it over DERP. See ipn/ipnlocal:
+// setControlClientLocked -> MagicConn().ResetNetInfoLast.
+//
+// The test brings a node up, records the home DERP region the test control
+// learned, re-logs the node in (new node identity, same control/network/NAT/
+// DERP), and asserts control re-learns the same non-zero home DERP for the new
+// identity. Without the fix this assertion times out at HomeDERP==0.
+func TestHomeDERPReportedAfterRelogin(t *testing.T) {
+	env := vmtest.New(t)
+	net := env.AddNetwork("2.1.1.1", "192.168.1.1/24", vnet.EasyNAT)
+	n := env.AddNode("node", net, vmtest.OS(vmtest.Gokrazy))
+
+	baseStep := env.AddStep("Record initial home DERP from control")
+	switchStep := env.AddStep("Re-login (logout + up)")
+	verifyStep := env.AddStep("Verify home DERP re-reported to control after relogin")
+
+	env.Start()
+
+	cs := env.ControlServer()
+
+	// Pin the home DERP region so the reported NetInfo (including PreferredDERP)
+	// is identical before and after the switch. natlab has two DERP regions with
+	// no latency differentiation, so the natural pick could differ across the
+	// switch; a changed PreferredDERP would NOT be de-duped and would mask the
+	// regression. The force persists on the long-lived magicsock.Conn across the
+	// in-process profile switch.
+	const region = 1
+	env.ForcePreferredDERP(n, region)
+
+	// Baseline: control learned the (forced) home DERP for the initial identity.
+	baseStep.Begin()
+	st := env.Status(n)
+	oldKey := st.Self.PublicKey
+	if err := tstest.WaitFor(30*time.Second, func() error {
+		cn := cs.Node(oldKey)
+		if cn == nil {
+			return fmt.Errorf("control has no node for initial key %v", oldKey.ShortString())
+		}
+		if cn.HomeDERP != region {
+			return fmt.Errorf("control home DERP for initial identity = %d, want %d", cn.HomeDERP, region)
+		}
+		return nil
+	}); err != nil {
+		baseStep.Fatal(err)
+	}
+	t.Logf("[node] initial: key=%s homeDERP=%d", oldKey.ShortString(), region)
+	baseStep.End(nil)
+
+	// Re-login on the same control/network/NAT/DERP. The new identity reports a
+	// structurally-identical NetInfo, which the buggy de-dup would have
+	// suppressed. (logout + up funnels through the same
+	// resetForProfileChangeLocked -> setControlClientLocked path as a
+	// localapi PUT /profiles/ switch.)
+	switchStep.Begin()
+	env.Relogin(n)
+	st2 := env.Status(n)
+	newKey := st2.Self.PublicKey
+	if newKey == oldKey {
+		switchStep.Fatalf("node key unchanged after relogin: %v", newKey.ShortString())
+	}
+	t.Logf("[node] after relogin: key=%s", newKey.ShortString())
+	switchStep.End(nil)
+
+	// Regression assertion: control must re-learn the same non-zero home DERP for
+	// the new identity. Times out at HomeDERP==0 without ResetNetInfoLast.
+	verifyStep.Begin()
+	if err := tstest.WaitFor(60*time.Second, func() error {
+		cn := cs.Node(newKey)
+		if cn == nil {
+			return fmt.Errorf("control has no node for new key %v yet", newKey.ShortString())
+		}
+		if cn.HomeDERP == 0 {
+			return fmt.Errorf("home DERP not re-reported after profile switch (HomeDERP=0)")
+		}
+		if cn.HomeDERP != region {
+			return fmt.Errorf("home DERP region changed across switch: was %d, now %d", region, cn.HomeDERP)
+		}
+		return nil
+	}); err != nil {
+		env.DumpStatus(n)
+		verifyStep.Fatal(err)
+	}
+	t.Logf("[node] home DERP %d re-reported to control after profile switch", region)
+	verifyStep.End(nil)
+}
+
 // TestMullvadExitNode verifies that a Tailscale client whose netmap contains
 // a plain-WireGuard exit node (the way Mullvad exit nodes are wired up by
 // the control plane) can route internet traffic through it, with the source
@@ -1061,7 +1153,111 @@ func TestCachedNetmapAfterRestart(t *testing.T) {
 // WireGuard tunnel after one is restarted while the control server is
 // unreachable. After restart the node must use only its on-disk cached
 // netmaps to re-connect and ping the other (still online) node.
+//
+// The test has two modes, pinging from the offline node to the online node,
+// and pinging from the online node to the offline node.
+//
+// TODO(cmol): The online -> offline test is skipped for now (as of 2026-06-12).
+// The TSMP disco key exchange currently relies on disco ping messages being
+// sent. These will however not be sent if there is not endpoints on the online
+// node which is possible in the event where a node has registered but not
+// finished STUN.
 func TestDirectConnectionWithCachedNetmapOnOneNode(t *testing.T) {
+	for _, testPingFrom := range []string{"offline", "online"} {
+		t.Run(fmt.Sprintf("ping_from_%s", testPingFrom), func(t *testing.T) {
+			if testPingFrom == "online" {
+				t.Skip("https://github.com/tailscale/tailscale/issues/19843")
+			}
+			env := vmtest.New(t)
+
+			aNet := env.AddNetwork("1.0.0.1", "192.168.1.1/24", vnet.EasyNAT)
+			bNet := env.AddNetwork("2.0.0.1", "192.168.2.1/24", vnet.EasyNAT)
+
+			// Node "a" is the offline peer, node "b" is the online peer.
+			a := env.AddNode("a", aNet,
+				vmtest.OS(vmtest.Gokrazy),
+				tailcfg.NodeCapMap{tailcfg.NodeAttrCacheNetworkMaps: nil})
+			b := env.AddNode("b", bNet,
+				vmtest.OS(vmtest.Gokrazy),
+				tailcfg.NodeCapMap{tailcfg.NodeAttrCacheNetworkMaps: nil})
+
+			pStr := "Ping a → b"
+			if testPingFrom == "online" {
+				pStr = "Ping b → a"
+			}
+			checkInitialMetrics := env.AddStep("Check initial client metrics")
+			cutControlStep := env.AddStep("Cut control server access from a")
+			restartStep := env.AddStep("Restart tailscaled on a")
+			tsmpPingStep := env.AddStep(fmt.Sprintf("%s TSMP (cached netmap, no control)", pStr))
+			discoPingStep := env.AddStep(fmt.Sprintf("%s Disco (want Direct)", pStr))
+			checkFinalMetrics := env.AddStep("Check final client metrics")
+
+			env.Start()
+
+			// Before: Verify that we have not recorded any cached contacts.
+			checkInitialMetrics.Begin()
+			checkClientMetrics(t, "Node A", env.ClientMetrics(a), map[string]int64{
+				"magicsock_cached_peer_contact_derp":   0,
+				"magicsock_cached_peer_contact_direct": 0,
+			})
+			checkInitialMetrics.End(nil)
+
+			cutControlStep.Begin()
+			a.DropControlTraffic()
+			env.ControlServer().SetOnMapRequest(func(nk key.NodePublic) {
+				if env.ControlServer().Node(nk).Name == a.Name() {
+					panic(fmt.Sprintf("got connection from %v", a.Name()))
+				}
+			})
+			cutControlStep.End(nil)
+
+			restartStep.Begin()
+			env.RestartTailscaled(a)
+			restartStep.End(nil)
+
+			// Set the direction of the ping.
+			pFrom, pTo := a, b
+			if testPingFrom == "online" {
+				pFrom, pTo = b, a
+			}
+
+			tsmpPingStep.Begin()
+			if err := env.Ping(pFrom, pTo, tailcfg.PingTSMP, 30*time.Second); err != nil {
+				tsmpPingStep.Fatal(err)
+			}
+			tsmpPingStep.End(nil)
+
+			discoPingStep.Begin()
+			if err := env.PingExpect(pFrom, pTo, vmtest.PingRouteDirect, 90*time.Second); err != nil {
+				discoPingStep.Fatal(err)
+			}
+			// Ping back, mostly to give time for the metrics to be set.
+			if err := env.PingExpect(pTo, pFrom, vmtest.PingRouteDirect, 30*time.Second); err != nil {
+				discoPingStep.Fatal(err)
+			}
+			discoPingStep.End(nil)
+
+			// After: Verify that we recorded a direct contact on the disconnected node.
+			checkFinalMetrics.Begin()
+			checkClientMetrics(t, "Node A", env.ClientMetrics(a), map[string]int64{
+				"magicsock_cached_peer_contact_direct": 1,
+			})
+			checkFinalMetrics.End(nil)
+		})
+	}
+}
+
+// TestDirectWithCachedNetmapOnTwoNodes verifies that two nodes with netmap
+// caching enabled (NodeAttrCacheNetworkMaps) can re-establish a direct
+// WireGuard tunnel after both restarted while the control server is
+// unreachable. After restart one node must use only its on-disk cached
+// netmaps to re-connect and ping the other node.
+// TODO(cmol): The test is skipped for now (as of 2026-06-12). The TSMP disco
+// key exchange currently relies on disco ping messages being sent. These will
+// however not be sent if there is not endpoints on the online node which is
+// possible in the event where a node has registered but not finished STUN.
+func TestDirectConnectionWithCachedNetmapOnTwoNodes(t *testing.T) {
+	t.Skip("https://github.com/tailscale/tailscale/issues/19843")
 	env := vmtest.New(t)
 
 	aNet := env.AddNetwork("1.0.0.1", "192.168.1.1/24", vnet.EasyNAT)
@@ -1093,15 +1289,18 @@ func TestDirectConnectionWithCachedNetmapOnOneNode(t *testing.T) {
 
 	cutControlStep.Begin()
 	a.DropControlTraffic()
+	b.DropControlTraffic()
 	env.ControlServer().SetOnMapRequest(func(nk key.NodePublic) {
-		if env.ControlServer().Node(nk).Name == a.Name() {
-			panic(fmt.Sprintf("got connection from %v", a.Name()))
+		nodeName := env.ControlServer().Node(nk).Name
+		if nodeName == a.Name() || nodeName == b.Name() {
+			panic(fmt.Sprintf("got connection from %v", nodeName))
 		}
 	})
 	cutControlStep.End(nil)
 
 	restartStep.Begin()
 	env.RestartTailscaled(a)
+	env.RestartTailscaled(b)
 	restartStep.End(nil)
 
 	tsmpPingStep.Begin()
