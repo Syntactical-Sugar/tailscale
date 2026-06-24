@@ -35,7 +35,7 @@ jobs:
           cache: true
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@b7bcab6379029e905e3f389a6bf301f1bc220662 # head as of 2026-03-04
+        uses: golangci/golangci-lint-action@ed485de1ff3b974c764ba768d82dda2e035d091e # head as of 2026-03-04
         with:
           version: v2.10.1
 
