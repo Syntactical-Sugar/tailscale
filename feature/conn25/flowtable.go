@@ -128,13 +128,19 @@ func WithMaxRemovedFlowsPerSweep(maxPer int) FlowTableOption {
 // NewFlowTable returns a [FlowTable] with maxEntries maximum entries.
 // A maxEntries of 0 indicates no maximum. See also [FlowTable].
 func NewFlowTable(maxEntries int, opts ...FlowTableOption) *FlowTable {
+	// Note: the maps below are deliberately not pre-sized to maxEntries.
+	// maxEntries is only an upper bound, enforced at insertion time; most
+	// nodes have far fewer concurrent flows. Pre-sizing to a large bound
+	// (e.g. the 100k-entry connector table) allocates ~8 MiB of map
+	// buckets per map up front, which alone nearly consumed the iOS
+	// Network Extension's 50 MiB jetsam limit (2x tables x 2 maps each).
 	ft := &FlowTable{
 		maxEntries:         maxEntries,
 		idleTimeout:        DefaultFlowIdleTimeout,
 		sweepInterval:      DefaultFlowSweepInterval,
 		maxRemovedPerSweep: DefaultMaxRemovedFlowsPerSweep,
-		fromTunCache:       make(map[flowtrack.Tuple]*list.Element, maxEntries),
-		fromWGCache:        make(map[flowtrack.Tuple]*list.Element, maxEntries),
+		fromTunCache:       make(map[flowtrack.Tuple]*list.Element),
+		fromWGCache:        make(map[flowtrack.Tuple]*list.Element),
 		lru:                list.New(),
 	}
 
@@ -300,4 +306,21 @@ func (t *FlowTable) removeFlowLocked(ele *list.Element) func() {
 	delete(t.fromWGCache, flow.data.FromWG.Tuple)
 
 	return flow.data.OnRemove
+}
+
+// Clear empties the entire FlowTable, losing track of all active flows. This
+// is used when all current flows between this and all other nodes cease to
+// exist; for example, when switching tailnets.
+func (t *FlowTable) Clear() {
+	var onRemoves []func()
+	t.mu.Lock()
+	for ele := t.lru.Back(); ele != nil; ele = t.lru.Back() {
+		onRemoves = append(onRemoves, t.removeFlowLocked(ele))
+	}
+	t.mu.Unlock()
+	for _, onRemove := range onRemoves {
+		if onRemove != nil {
+			onRemove()
+		}
+	}
 }

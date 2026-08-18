@@ -26,6 +26,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/hostinfo"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -86,7 +87,7 @@ type mapSession struct {
 	// Fields storing state over the course of multiple MapResponses.
 	lastPrintMap           time.Time
 	lastNode               tailcfg.NodeView
-	lastCapSet             set.Set[tailcfg.NodeCapability]
+	lastCapSet             set.Set[nodecap.Cap]
 	lastDNSConfig          *tailcfg.DNSConfig
 	lastDERPMap            *tailcfg.DERPMap
 	lastUserProfile        map[tailcfg.UserID]tailcfg.UserProfileView
@@ -200,6 +201,11 @@ func (ms *mapSession) Close() {
 var ErrChangeQueueClosed = errors.New("change queue closed")
 
 func (ms *mapSession) updateDiscoForNode(id tailcfg.NodeID, key key.NodePublic, discoKey key.DiscoPublic, lastSeen time.Time, online bool) error {
+	if discoKey.IsZero() {
+		ms.logf("[v1] controlclient: received zero disco key update from nodeID %v", id)
+		return nil
+	}
+
 	ms.cqmu.Lock()
 
 	if ms.changeQueueClosed {
@@ -362,7 +368,7 @@ func (ms *mapSession) handleNonKeepAliveMapResponse(ctx context.Context, resp *t
 }
 
 func (ms *mapSession) tryMarkDiscoAsLearnedFromTSMP(res *tailcfg.MapResponse) {
-	dun, ok := ms.netmapUpdater.(patchDiscoKeyer)
+	dun, ok := ms.netmapUpdater.(DiscoKeyUpdater)
 	if !ok {
 		return
 	}
@@ -399,6 +405,12 @@ func upgradeNode(n *tailcfg.Node) {
 	}
 
 	if n.AllowedIPs == nil {
+		n.AllowedIPs = slices.Clone(n.Addresses)
+	}
+	// Unsigned peers aren't covered by tailnet lock, so a (possibly malicious)
+	// control server must not grant them network access via advertised routes.
+	// Strip any AllowedIPs beyond their own addresses.
+	if n.UnsignedPeerAPIOnly && !slices.Equal(n.AllowedIPs, n.Addresses) {
 		n.AllowedIPs = slices.Clone(n.Addresses)
 	}
 }
@@ -592,7 +604,7 @@ func (ms *mapSession) updateStateFromResponse(resp *tailcfg.MapResponse) {
 	if resp.Node != nil {
 		ms.lastNode = resp.Node.View()
 
-		capSet := set.Set[tailcfg.NodeCapability]{}
+		capSet := set.Set[nodecap.Cap]{}
 		for _, c := range resp.Node.Capabilities {
 			capSet.Add(c)
 		}

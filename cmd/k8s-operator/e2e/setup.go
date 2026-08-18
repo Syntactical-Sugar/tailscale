@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -50,6 +51,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	klog "sigs.k8s.io/controller-runtime/pkg/log"
 	kzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
 	"sigs.k8s.io/kind/pkg/cluster"
 	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
 	"sigs.k8s.io/kind/pkg/cmd"
@@ -64,10 +66,12 @@ import (
 )
 
 const (
-	pebbleTag       = "2.8.0"
-	ns              = "default"
-	tmp             = "/tmp/k8s-operator-e2e"
-	kindClusterName = "k8s-operator-e2e"
+	pebbleTag           = "2.8.0"
+	ns                  = "default"
+	tmp                 = "/tmp/k8s-operator-e2e"
+	kindClusterName     = "k8s-operator-e2e"
+	testCAsConfigMap    = "test-cas"
+	testCAsConfigMapKey = "test-cas.pem"
 )
 
 var (
@@ -78,13 +82,22 @@ var (
 	restCfg            *rest.Config      // For constructing a client-go client if necessary.
 	kubeClient         client.WithWatch  // For k8s API calls.
 	clusterLoginServer string
+	clusterIPv4Support bool // whether the test cluster supports IPv4.
+	clusterIPv6Support bool // whether the test cluster supports IPv6.
 
 	//go:embed certs/pebble.minica.crt
 	pebbleMiniCACert []byte
 
-	// Either nil (system) or pebble CAs if pebble is deployed for devcontrol.
-	// pebble has a static "mini" CA that its ACME directory URL serves a cert
-	// from, and also dynamically generates a different CA for issuing certs.
+	// Let's Encrypt staging environment root "Pretend Pear X1", used when
+	// running against real tailnets.
+	// Available from https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem
+	//go:embed certs/letsencrypt-stg-root-x1.pem
+	leStagingRootX1 []byte
+
+	// Either  pebble CAs (if pebble is deployed for devcontrol) or
+	// Let's Encrypt staging when running against real tailnets).
+	// pebble has a static "mini" CA that its ACME directory URL serves a cert from,
+	// and also dynamically generates a different CA for issuing certs.
 	testCAs *x509.CertPool
 
 	//go:embed acl.hujson
@@ -99,6 +112,7 @@ var (
 	fSkipCleanup = flag.Bool("skip-cleanup", false, "if true, do not delete the kind cluster (if created) or tmp dir on exit")
 	fCluster     = flag.Bool("cluster", false, "if true, create or use a pre-existing kind cluster named k8s-operator-e2e; otherwise assume a usable cluster already exists in kubeconfig")
 	fBuild       = flag.Bool("build", false, "if true, build and deploy the operator and container images from the current checkout; otherwise assume the operator is already set up")
+	fBaseImage   = flag.String("base-image", "", "if set, use this image as the base for all images built by --build, instead of the default base image in build_docker.sh")
 )
 
 func runTests(m *testing.M) (int, error) {
@@ -136,6 +150,11 @@ func runTests(m *testing.M) (int, error) {
 
 		if !slices.Contains(clusters, kindClusterName) {
 			if err := kindProvider.Create(kindClusterName,
+				cluster.CreateWithV1Alpha4Config(&v1alpha4.Cluster{
+					Networking: v1alpha4.Networking{
+						IPFamily: v1alpha4.DualStackFamily,
+					},
+				}),
 				cluster.CreateWithWaitForReady(5*time.Minute),
 				cluster.CreateWithKubeconfigPath(kubeconfig),
 				cluster.CreateWithNodeImage("kindest/node:v1.35.0"),
@@ -161,13 +180,19 @@ func runTests(m *testing.M) (int, error) {
 		return 0, fmt.Errorf("error creating Kubernetes client: %w", err)
 	}
 
-	var (
-		clientID, clientSecret string   // OAuth client for the first tailnet (for the operator to use).
-		caPaths                []string // Extra CA cert file paths to add to images.
+	if err := detectClusterIPFamilies(ctx, logger, kubeClient); err != nil {
+		return 0, fmt.Errorf("error detecting cluster IP families: %w", err)
+	}
 
-		certsDir                           = filepath.Join(tmp, "certs") // Directory containing extra CA certs to add to images.
-		secondClientID, secondClientSecret string                        // OAuth client for the second tailnet (for the operator to use).
+	var (
+		clientID, clientSecret             string // OAuth client for the first tailnet (for the operator to use).
+		secondClientID, secondClientSecret string // OAuth client for the second tailnet (for the operator to use).
+
+		caPaths  []string                      // Extra CA cert file paths to add to images.
+		certsDir = filepath.Join(tmp, "certs") // Directory containing extra CA certs to add to images.
+		caPEM    []byte                        // Used to collect and then publish test-cas ConfigMap.
 	)
+	testCAs = x509.NewCertPool()
 	if *fDevcontrol {
 		// Deploy pebble and get its certs.
 		if err = applyPebbleResources(ctx, kubeClient); err != nil {
@@ -183,7 +208,6 @@ func runTests(m *testing.M) (int, error) {
 			return 0, fmt.Errorf("failed to set up port forwarding to pebble: %w", err)
 		}
 
-		testCAs = x509.NewCertPool()
 		if ok := testCAs.AppendCertsFromPEM(pebbleMiniCACert); !ok {
 			return 0, fmt.Errorf("failed to parse pebble minica cert")
 		}
@@ -200,6 +224,7 @@ func runTests(m *testing.M) (int, error) {
 		if ok := testCAs.AppendCertsFromPEM(pebbleCAChain); !ok {
 			return 0, fmt.Errorf("failed to parse pebble ca chain cert")
 		}
+		caPEM = appendPEM(caPEM, pebbleMiniCACert, pebbleCAChain)
 
 		if err = os.MkdirAll(certsDir, 0755); err != nil {
 			return 0, fmt.Errorf("failed to create certs dir: %w", err)
@@ -340,6 +365,10 @@ func runTests(m *testing.M) (int, error) {
 		}
 
 	} else {
+		if ok := testCAs.AppendCertsFromPEM(leStagingRootX1); !ok {
+			return 0, fmt.Errorf("failed to parse Let's Encrypt staging root")
+		}
+		caPEM = appendPEM(caPEM, leStagingRootX1)
 		clientSecret = os.Getenv("TS_API_CLIENT_SECRET")
 		if clientSecret == "" {
 			return 0, fmt.Errorf("must use --devcontrol or set TS_API_CLIENT_SECRET to an OAuth client suitable for the operator")
@@ -366,6 +395,19 @@ func runTests(m *testing.M) (int, error) {
 		}
 	}
 
+	// Publish the trustedCAs as a ConfigMap that can be used by in-cluster
+	// testing workloads.
+	if len(caPEM) > 0 {
+		caCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: testCAsConfigMap, Namespace: ns},
+			Data:       map[string]string{testCAsConfigMapKey: string(caPEM)},
+		}
+		if err := createOrUpdate(ctx, kubeClient, caCM); err != nil {
+			return 0, fmt.Errorf("failed to publish test CAs ConfigMap: %w", err)
+		}
+		defer kubeClient.Delete(context.Background(), caCM)
+	}
+
 	var ossTag string
 	if *fBuild {
 		// TODO(tomhjp): proper support for --build=false and layering pebble certs on top of existing images.
@@ -378,13 +420,17 @@ func runTests(m *testing.M) (int, error) {
 			return 0, err
 		}
 		logger.Infof("using OSS image tag: %q", ossTag)
+		if *fBaseImage != "" {
+			logger.Infof("using base image: %q", *fBaseImage)
+		}
 		ossImageToTarget := map[string]string{
-			"local/k8s-operator": "publishdevoperator",
-			"local/tailscale":    "publishdevimage",
-			"local/k8s-proxy":    "publishdevproxy",
+			"local/k8s-operator":   "publishdevoperator",
+			"local/tailscale":      "publishdevimage",
+			"local/k8s-proxy":      "publishdevproxy",
+			"local/k8s-nameserver": "publishdevnameserver",
 		}
 		for img, target := range ossImageToTarget {
-			if err := buildImage(ctx, ossDir, img, target, ossTag, caPaths); err != nil {
+			if err := buildImage(ctx, ossDir, img, target, ossTag, *fBaseImage, caPaths); err != nil {
 				return 0, err
 			}
 			nodes, err := kindProvider.ListInternalNodes(kindClusterName)
@@ -439,6 +485,8 @@ func runTests(m *testing.M) (int, error) {
 	}
 	if *fDevcontrol {
 		extraEnv = append(extraEnv, map[string]any{"name": "TS_DEBUG_ACME_DIRECTORY_URL", "value": "https://pebble:14000/dir"})
+	} else {
+		extraEnv = append(extraEnv, map[string]any{"name": "TS_DEBUG_ACME_DIRECTORY_URL", "value": "https://acme-staging-v02.api.letsencrypt.org/directory"})
 	}
 	values := map[string]any{
 		"loginServer": clusterLoginServer,
@@ -484,6 +532,26 @@ func runTests(m *testing.M) (int, error) {
 	if err := applyDefaultProxyClass(ctx, logger, kubeClient); err != nil {
 		return 0, fmt.Errorf("failed to apply default ProxyClass: %w", err)
 	}
+
+	// Leave the nameserver image unset when nothing was built so
+	// the operator falls back to the default.
+	// TODO(beckypauley): fix for other images where build is false.
+	nameserverImg := &tsapi.NameserverImage{}
+	if ossTag != "" {
+		nameserverImg.Repo = "local/k8s-nameserver"
+		nameserverImg.Tag = ossTag
+	}
+	dnsConfig, err := deployNameserver(ctx, logger, kubeClient, nameserverImg)
+	if err != nil {
+		return 0, fmt.Errorf("failed to deploy nameserver: %w", err)
+	}
+	defer kubeClient.Delete(context.Background(), dnsConfig)
+
+	restoreClusterDNS, err := patchClusterDNS(ctx, logger, dnsConfig.Status.Nameserver.IP)
+	if err != nil {
+		return 0, fmt.Errorf("failed to patch cluster DNS: %w", err)
+	}
+	defer restoreClusterDNS()
 
 	caps := tailscale.KeyCapabilities{}
 	caps.Devices.Create.Preauthorized = true
@@ -660,6 +728,7 @@ func applyDefaultProxyClass(ctx context.Context, logger *zap.SugaredLogger, cl c
 			Name: "default",
 		},
 		Spec: tsapi.ProxyClassSpec{
+			UseLetsEncryptStagingEnvironment: !*fDevcontrol,
 			StatefulSet: &tsapi.StatefulSet{
 				Pod: &tsapi.Pod{
 					TailscaleInitContainer: &tsapi.Container{
@@ -698,6 +767,124 @@ func applyDefaultProxyClass(ctx context.Context, logger *zap.SugaredLogger, cl c
 	}
 
 	return nil
+}
+
+// appendPEM joins PEM blobs with a newline separator so a blob lacking a
+// trailing newline doesn't glue its END line to the next BEGIN line.
+// Otherwise curl/OpenSSL can silently drop the later certs.
+// TODO(beckypauley):  avoid maintaining both caPEM and testCAs. This can then be removed.
+func appendPEM(dst []byte, blobs ...[]byte) []byte {
+	for _, b := range blobs {
+		if len(b) == 0 {
+			continue
+		}
+		if len(dst) > 0 && dst[len(dst)-1] != '\n' {
+			dst = append(dst, '\n')
+		}
+		dst = append(dst, b...)
+	}
+	return dst
+}
+
+func deployNameserver(ctx context.Context, logger *zap.SugaredLogger, cl client.Client, img *tsapi.NameserverImage) (*tsapi.DNSConfig, error) {
+	dc := &tsapi.DNSConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "dns"},
+		Spec:       tsapi.DNSConfigSpec{Nameserver: &tsapi.Nameserver{Image: img}},
+	}
+	if err := createOrUpdate(ctx, cl, dc); err != nil {
+		return nil, fmt.Errorf("failed to create DNSConfig: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	ticker := time.NewTicker(time.Second * 2)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("timeout waiting for nameserver to be ready")
+		case <-ticker.C:
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(dc), dc); err != nil {
+				return nil, fmt.Errorf("failed to get DNSConfig: %w", err)
+			}
+			if tsoperator.DNSCfgIsReady(dc) && dc.Status.Nameserver != nil && dc.Status.Nameserver.IP != "" {
+				logger.Infof("nameserver ready; Service IP %s", dc.Status.Nameserver.IP)
+				return dc, nil
+			}
+			logger.Info("waiting for nameserver to be ready...")
+		}
+	}
+}
+
+func patchClusterDNS(ctx context.Context, logger *zap.SugaredLogger, nameserverIP string) (func(), error) {
+	if cm := getDNSConfigMap(ctx, "coredns"); cm != nil && cm.Data["Corefile"] != "" {
+		corefile := stripTSNetZone(cm.Data["Corefile"]) + fmt.Sprintf(`
+ts.net:53 {
+    errors
+    cache 30
+    forward . %s
+}
+`, nameserverIP)
+		return patchDNSConfigMap(logger, cm, "Corefile", corefile)
+	}
+	if cm := getDNSConfigMap(ctx, "kube-dns"); cm != nil {
+		stub, err := json.Marshal(map[string][]string{"ts.net": {nameserverIP}})
+		if err != nil {
+			return nil, fmt.Errorf("marshalling stubDomains: %w", err)
+		}
+		return patchDNSConfigMap(logger, cm, "stubDomains", string(stub))
+	}
+	return nil, fmt.Errorf("cluster DNS is not a patchable CoreDNS/kube-dns")
+}
+
+func getDNSConfigMap(ctx context.Context, name string) *corev1.ConfigMap {
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: name}}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(cm), cm); err != nil {
+		return nil
+	}
+	return cm
+}
+
+// patchDNSConfigMap updates the given Configmap and returns a closure
+// for test cleanup.
+func patchDNSConfigMap(logger *zap.SugaredLogger, cm *corev1.ConfigMap, key, value string) (func(), error) {
+	orig := maps.Clone(cm.Data)
+	if cm.Data == nil {
+		cm.Data = map[string]string{}
+	}
+	cm.Data[key] = value
+	if err := kubeClient.Update(context.Background(), cm); err != nil {
+		return nil, fmt.Errorf("patching %s %s: %w", cm.Name, key, err)
+	}
+	logger.Infof("patched %s %s with ts.net entry", cm.Name, key)
+
+	name := cm.Name
+	return func() {
+		restore := getDNSConfigMap(context.Background(), name)
+		if restore == nil {
+			logger.Warnf("restoring %s %s: get failed", name, key)
+			return
+		}
+		restore.Data = orig
+		if err := kubeClient.Update(context.Background(), restore); err != nil {
+			logger.Warnf("restoring %s %s: %v", name, key, err)
+		}
+	}, nil
+}
+
+// stripTSNetZone removes a previously-appended `ts.net:53 { ... }` server block
+// from a Corefile.
+func stripTSNetZone(corefile string) string {
+	idx := strings.Index(corefile, "ts.net:53 {")
+	if idx == -1 {
+		return corefile
+	}
+	rest := corefile[idx:]
+	end := strings.Index(rest, "\n}")
+	if end == -1 {
+		return corefile[:idx]
+	}
+	return corefile[:idx] + rest[end+len("\n}"):]
 }
 
 // forwardLocalPortToPod sets up port forwarding to the specified Pod and remote port.
@@ -811,17 +998,23 @@ func pebbleGet(ctx context.Context, port uint16, path string) ([]byte, error) {
 	return b, nil
 }
 
-func buildImage(ctx context.Context, dir, repo, target, tag string, extraCACerts []string) error {
+func buildImage(ctx context.Context, dir, repo, target, tag, baseImage string, extraCACerts []string) error {
 	var files []string
 	for _, f := range extraCACerts {
 		files = append(files, fmt.Sprintf("%s:/etc/ssl/certs/%s", f, filepath.Base(f)))
 	}
-	cmd := exec.CommandContext(ctx, "make", target,
+	args := []string{target,
 		"PLATFORM=local",
 		fmt.Sprintf("TAGS=%s", tag),
 		fmt.Sprintf("REPO=%s", repo),
 		fmt.Sprintf("FILES=%s", strings.Join(files, ",")),
-	)
+	}
+	if baseImage != "" {
+		// make exports command line variables to recipes, so this reaches
+		// build_docker.sh as the BASE env var.
+		args = append(args, fmt.Sprintf("BASE=%s", baseImage))
+	}
+	cmd := exec.CommandContext(ctx, "make", args...)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -838,6 +1031,48 @@ func createOrUpdate(ctx context.Context, cl client.Client, obj client.Object) er
 			return err
 		}
 		return cl.Update(ctx, obj)
+	}
+	return nil
+}
+
+// detectClusterIPFamilies determines which IP families the cluster supports by
+// creating a throwaway ClusterIP Service with PreferDualStack and reading back
+// the IP families the API server assigns.
+func detectClusterIPFamilies(ctx context.Context, logger *zap.SugaredLogger, cl client.Client) error {
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ipfamily-probe",
+			Namespace: ns,
+		},
+		Spec: corev1.ServiceSpec{
+			Type:           corev1.ServiceTypeClusterIP,
+			IPFamilyPolicy: new(corev1.IPFamilyPolicyPreferDualStack),
+			Ports: []corev1.ServicePort{
+				{Name: "probe", Protocol: corev1.ProtocolTCP, Port: 80},
+			},
+		},
+	}
+	if err := cl.Create(ctx, svc); err != nil {
+		return fmt.Errorf("failed to create IP family Service: %w", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := cl.Delete(ctx, svc); err != nil {
+			logger.Warnf("failed to clean up IP family Service %s/%s: %v", svc.Namespace, svc.Name, err)
+		}
+	}()
+
+	for _, ip := range svc.Spec.IPFamilies {
+		switch ip {
+		case corev1.IPv4Protocol:
+			clusterIPv4Support = true
+		case corev1.IPv6Protocol:
+			clusterIPv6Support = true
+		}
+	}
+	if !clusterIPv4Support && !clusterIPv6Support {
+		return fmt.Errorf("Service %s/%s reported no IP families", svc.Namespace, svc.Name)
 	}
 	return nil
 }

@@ -35,6 +35,8 @@ import (
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
@@ -578,7 +580,7 @@ func (h *peerAPIHandler) CanDebug() bool { return h.canDebug() }
 // canDebug reports whether h can debug this node (goroutines, metrics,
 // magicsock internal state, etc).
 func (h *peerAPIHandler) canDebug() bool {
-	if !h.selfNode.HasCap(tailcfg.CapabilityDebug) {
+	if !h.selfNode.HasCap(nodecap.Debug) {
 		// This node does not expose debug info.
 		return false
 	}
@@ -586,17 +588,17 @@ func (h *peerAPIHandler) canDebug() bool {
 		// Unsigned peers can't debug.
 		return false
 	}
-	return h.isSelf || h.peerHasCap(tailcfg.PeerCapabilityDebugPeer)
+	return h.isSelf || h.peerHasCap(peercap.DebugPeer)
 }
 
 var allowSelfIngress = envknob.RegisterBool("TS_ALLOW_SELF_INGRESS")
 
 // canIngress reports whether h can send ingress requests to this node.
 func (h *peerAPIHandler) canIngress() bool {
-	return h.peerHasCap(tailcfg.PeerCapabilityIngress) || (allowSelfIngress() && h.isSelf)
+	return h.peerHasCap(peercap.Ingress) || (allowSelfIngress() && h.isSelf)
 }
 
-func (h *peerAPIHandler) peerHasCap(wantCap tailcfg.PeerCapability) bool {
+func (h *peerAPIHandler) peerHasCap(wantCap peercap.Cap) bool {
 	return h.PeerCaps().HasCapability(wantCap)
 }
 
@@ -674,6 +676,12 @@ func (h *peerAPIHandler) handleServeDNSFwd(w http.ResponseWriter, r *http.Reques
 	dh.ServeHTTP(w, r)
 }
 
+// HookReplyToDNSQueries allows extensions to register a willingness to allow
+// handling PeerAPI DNS queries for the peer making this request.
+var HookReplyToDNSQueries = feature.Hooks[func(PeerAPIHandler) bool]{
+	offersExitNodeOrAppConnectorAndPeerHasAutogroupInternet,
+}
+
 func (h *peerAPIHandler) replyToDNSQueries() bool {
 	if !buildfeatures.HasDNS {
 		return false
@@ -683,15 +691,34 @@ func (h *peerAPIHandler) replyToDNSQueries() bool {
 		// without further checks.
 		return true
 	}
-	b := h.ps.b
-	if !b.OfferingExitNode() && !b.OfferingAppConnector() {
-		// If we're not an exit node or app connector, there's
-		// no point to being a DNS server for somebody.
-		return false
-	}
 	if !h.remoteAddr.IsValid() {
 		// This should never be the case if the peerAPIHandler
 		// was wired up correctly, but just in case.
+		return false
+	}
+
+	for _, hook := range HookReplyToDNSQueries {
+		if hook(h) {
+			return true
+		}
+	}
+	return false
+}
+
+// offersExitNodeOrAppConnectorAndPeerHasAutogroupInternet is run as part of
+// [HookReplyToDNSQueries] and handles our legacy PeerAPI DNS acceptance
+// criteria:
+//   - When a node is advertising an exit node it will accept DNS queries
+//     from peers that have access to autogroup:internet.
+//   - When a node is advertising an app connector, it will accept DNS queries
+//     to peers that have access to a relevant app.
+//
+// Further details about how these are accomplished are in inline comments.
+func offersExitNodeOrAppConnectorAndPeerHasAutogroupInternet(h PeerAPIHandler) bool {
+	b := h.LocalBackend()
+	if !b.OfferingExitNode() && !b.OfferingAppConnector() {
+		// If we're not an exit node or app connector, this hook
+		// doesn't apply.
 		return false
 	}
 	// Otherwise, we're an exit node but the peer is not us, so
@@ -716,7 +743,7 @@ func (h *peerAPIHandler) replyToDNSQueries() bool {
 	// arbitrary. DNS runs over TCP and UDP, so sure... we check
 	// TCP.
 	dstIP := netaddr.IPv4(0, 0, 0, 0)
-	remoteIP := h.remoteAddr.Addr()
+	remoteIP := h.RemoteAddr().Addr()
 	if remoteIP.Is6() {
 		// autogroup:internet for IPv6 is defined to start with 2000::/3,
 		// so use 2000::0 as the probe "the internet" address.

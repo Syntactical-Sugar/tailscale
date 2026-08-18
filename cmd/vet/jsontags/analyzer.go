@@ -38,7 +38,7 @@ func run(pass *analysis.Pass) (any, error) {
 			if tag == "" {
 				continue
 			}
-			var seenName, hasFormat bool
+			var seenName bool
 			for opt := range strings.SplitSeq(tag, ",") {
 				if !seenName {
 					seenName = true
@@ -112,16 +112,21 @@ func run(pass *analysis.Pass) (any, error) {
 						report(pass, structType, fieldVar, OmitEmptyShouldBeOmitZeroButHasIsZero)
 					}
 				case "string":
-					if !isNumericKind(fieldVar.Type()) {
+					if !isStringTagSafe(fieldVar.Type()) {
 						report(pass, structType, fieldVar, StringOnNonNumericKind)
 					}
 				default:
-					key, _, ok := strings.Cut(opt, ":")
-					hasFormat = key == "format" && ok
+					// The `format` tag option did not make the cut for
+					// Go 1.27's encoding/json/v2. Its mere presence in a
+					// struct tag makes both v1 and v2 marshaling fail at
+					// runtime unless the caller passes the
+					// jsonv2.ExperimentalSupportFormatTag option.
+					// See https://go.dev/issue/71631 and
+					// https://github.com/tailscale/tailscale/issues/20528.
+					if key, _, ok := strings.Cut(opt, ":"); ok && key == "format" {
+						report(pass, structType, fieldVar, FormatUnsupported)
+					}
 				}
-			}
-			if !hasFormat && isTimeDuration(mayPointerElem(fieldVar.Type())) {
-				report(pass, structType, fieldVar, FormatMissingOnTimeDuration)
 			}
 		}
 	})
@@ -152,26 +157,6 @@ func isString(t types.Type) bool {
 	return ok && basic.Kind() == types.String
 }
 
-// isTimeDuration reports whether t is a time.Duration type.
-func isTimeDuration(t types.Type) bool {
-	return isNamed(t, "time", "Duration")
-}
-
-// mayPointerElem returns the pointed-at type if t is a pointer,
-// otherwise it returns t as-is.
-func mayPointerElem(t types.Type) types.Type {
-	if pointer, ok := t.(*types.Pointer); ok {
-		return pointer.Elem()
-	}
-	return t
-}
-
-// isNamed reports t is a named typed of the given path and name.
-func isNamed(t types.Type, path, name string) bool {
-	gotPath, gotName := typeName(t)
-	return gotPath == path && gotName == name
-}
-
 // typeName reports the pkgPath and name of the type.
 // It recursively follows type aliases to get the underlying named type.
 func typeName(t types.Type) (pkgPath, name string) {
@@ -198,4 +183,32 @@ func isNumericKind(t types.Type) bool {
 		return true
 	}
 	return false
+}
+
+// isStringTagSafe reports whether the JSON `string` tag option is valid for t.
+// It is valid for basic numeric types and for jsonformat types that encode as
+// JSON numbers (and honor StringifyNumbers / the string tag).
+func isStringTagSafe(t types.Type) bool {
+	if pointer, ok := t.(*types.Pointer); ok {
+		t = pointer.Elem()
+	}
+	if isNumericKind(t) {
+		return true
+	}
+	return isJSONFormatNumeric(t)
+}
+
+// isJSONFormatNumeric reports whether t is a tailscale.com/types/jsonformat
+// type that represents a JSON number (optionally stringified).
+func isJSONFormatNumeric(t types.Type) bool {
+	pkgPath, name := typeName(t)
+	if pkgPath != "tailscale.com/types/jsonformat" {
+		return false
+	}
+	switch name {
+	case "TimeUnix", "TimeUnixNano", "DurationNano":
+		return true
+	default:
+		return false
+	}
 }

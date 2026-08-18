@@ -61,6 +61,14 @@ type Config struct {
 	// OnlyIPv6, if true, uses the IPv6 service IP (for MagicDNS)
 	// instead of the IPv4 version (100.100.100.100).
 	OnlyIPv6 bool
+	// MagicDNSHostsUnrouted is whether MagicDNS host records are
+	// served on demand via [resolver.MagicDNSHosts] (so are not
+	// listed in Hosts) without being covered by any Routes entry;
+	// that is, MagicDNS domain routing is off. It preserves the
+	// effect the node records had when they were listed in Hosts:
+	// hasHostsWithoutSplitDNSRoutes reports true, keeping quad-100
+	// in the OS resolver path so the names still resolve.
+	MagicDNSHostsUnrouted bool
 }
 
 var magicDNSDualStack = envknob.RegisterBool("TS_DEBUG_MAGIC_DNS_DUAL_STACK")
@@ -127,14 +135,32 @@ func (c Config) hasDefaultIPResolversOnly() bool {
 // hasHostsWithoutSplitDNSRoutes reports whether c contains any Host entries
 // that aren't covered by a SplitDNS route suffix.
 func (c Config) hasHostsWithoutSplitDNSRoutes() bool {
-	// TODO(bradfitz): this could be more efficient, but we imagine
-	// the number of SplitDNS routes and/or hosts will be small.
+	if c.MagicDNSHostsUnrouted {
+		return true
+	}
+	// Hosts is small here on most platforms: per-node records are
+	// served via [resolver.MagicDNSHosts] (accounted for above), so
+	// only control's DNS.ExtraRecords remain. On Windows it still
+	// carries every node's records for the hosts-file path.
 	for host := range c.Hosts {
 		if !c.hasSplitDNSRouteForHost(host) {
 			return true
 		}
 	}
 	return false
+}
+
+// requiresPrimaryResolver reports whether c can only be served correctly with
+// quad-100 installed as the OS's primary (catch-all) resolver, rather than
+// scoped to a set of match domains.
+//
+// That's the case when c has names quad-100 must answer that no route suffix
+// covers, so there is no suffix to scope to. dnsConfigForNetmap pairs every
+// ExtraRecord it emits with a route, so in practice this is the
+// MagicDNS-names-present but MagicDNS-domain-routing-off case
+// (MagicDNSHostsUnrouted).
+func (c Config) requiresPrimaryResolver() bool {
+	return c.hasHostsWithoutSplitDNSRoutes()
 }
 
 // hasSplitDNSRouteForHost reports whether c contains a SplitDNS route

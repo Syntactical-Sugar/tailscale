@@ -35,6 +35,7 @@ import (
 	"go4.org/mem"
 	"tailscale.com/client/local"
 	"tailscale.com/cmd/testwrapper/flakytest"
+	"tailscale.com/envknob"
 	"tailscale.com/feature"
 	_ "tailscale.com/feature/clientupdate"
 	"tailscale.com/health"
@@ -44,6 +45,7 @@ import (
 	"tailscale.com/net/tstun"
 	"tailscale.com/net/udprelay/status"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tstest"
 	"tailscale.com/tstest/integration/testcontrol"
 	"tailscale.com/types/key"
@@ -57,6 +59,11 @@ func TestMain(m *testing.M) {
 	// Have to disable UPnP which hits the network, otherwise it fails due to HTTP proxy.
 	os.Setenv("TS_DISABLE_UPNP", "true")
 	flag.Parse()
+	if *runWindowsServiceTests && runtime.GOOS == "windows" {
+		// On Windows the service is a singleton, so its tests run serially.
+		// envknob.Setenv refreshes the TS_SERIAL_TESTS that tstest.Parallel reads.
+		envknob.Setenv("TS_SERIAL_TESTS", "true")
+	}
 	v := m.Run()
 	if v != 0 {
 		os.Exit(v)
@@ -200,6 +207,9 @@ func TestExpectedFeaturesLinked(t *testing.T) {
 }
 
 func TestCollectPanic(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("has a Windows panic-capture race; see #20443")
+	}
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
 	n := NewTestNode(t, env)
@@ -532,6 +542,138 @@ func TestOneNodeUpAuth(t *testing.T) {
 	}
 }
 
+// TestRetagStaleMapRequestRace reproduces tailscale/tailscale#20365: a node
+// tagged tag:tag1, where tag:tag1 owns tag:tag2, is retagged with "tailscale
+// up --advertise-tags=tag:tag2". This should always succeed, but sometimes
+// the machine is logged out instead.
+//
+// The cause is a race: "tailscale up" makes LocalBackend.Start shut down the
+// old control client asynchronously while the new one starts, so a lite map
+// update carrying the old Hostinfo.RequestTags can still be in flight when
+// the new client's requests retag the node. If control processes the stale
+// update after the tag transition, it looks like a request to change the
+// node's tags from tag:tag2 back to tag:tag1. That fails the tag ownership
+// check (tag:tag2 doesn't own tag:tag1), and control expires the node's key
+// to force reauthentication, logging the machine out.
+//
+// The test recreates that interleaving deterministically: it triggers a lite
+// map update carrying the old tags (any routine hostinfo change does that),
+// holds it at the server, retags the node, and only then lets the held
+// update be processed.
+func TestRetagStaleMapRequestRace(t *testing.T) {
+	tstest.Parallel(t)
+
+	var (
+		holdStale    atomic.Bool
+		staleHeld    = make(chan struct{}, 1)
+		staleRelease = make(chan struct{})
+		staleDone    = make(chan struct{}, 1)
+	)
+	env := NewTestEnv(t, ConfigureControl(func(control *testcontrol.Server) {
+		control.TagOwners = map[string][]string{
+			"tag:tag1": nil,
+			"tag:tag2": {"tag:tag1"},
+		}
+		control.HoldMapRequest = func(req *tailcfg.MapRequest) (done func()) {
+			if req.Stream || req.Hostinfo == nil || !holdStale.Load() {
+				return nil
+			}
+			if !slices.Equal(req.Hostinfo.RequestTags, []string{"tag:tag1"}) {
+				return nil
+			}
+			select {
+			case staleHeld <- struct{}{}:
+			default:
+			}
+			<-staleRelease
+			return func() {
+				select {
+				case staleDone <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}))
+
+	n1 := NewTestNode(t, env)
+	d1 := n1.StartDaemon()
+	defer d1.MustCleanShutdown(t)
+	n1.AwaitResponding()
+	n1.MustUp("--advertise-tags=tag:tag1")
+	n1.AwaitRunning()
+
+	nodes := env.Control.AllNodes()
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodes))
+	}
+	origKey := nodes[0].Key
+	if got, want := nodes[0].Tags, []string{"tag:tag1"}; !slices.Equal(got, want) {
+		t.Fatalf("node tags = %v; want %v", got, want)
+	}
+
+	// Make the current control client send a lite map update carrying the
+	// old RequestTags, as any routine hostinfo change does. Control holds
+	// it (per HoldMapRequest above) so that it's still outstanding when
+	// the node is retagged below. Shutting down that control client
+	// cancels the request but can't unsend it; control still has it.
+	holdStale.Store(true)
+	if out, err := n1.Tailscale("set", "--hostname=retag-race-test").CombinedOutput(); err != nil {
+		t.Fatalf("tailscale set: %v, %s", err, out)
+	}
+	select {
+	case <-staleHeld:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the stale map update to reach control")
+	}
+
+	// Retag the node while the stale update is still outstanding. This
+	// doesn't block on the held update: the new control client's requests
+	// are processed while it is held.
+	n1.MustUp("--advertise-tags=tag:tag2")
+	if err := tstest.WaitFor(10*time.Second, func() error {
+		n := env.Control.Node(origKey)
+		if n == nil {
+			return fmt.Errorf("node %v not found in control", origKey.ShortString())
+		}
+		if !slices.Equal(n.Tags, []string{"tag:tag2"}) {
+			return fmt.Errorf("node tags = %v; want [tag:tag2]", n.Tags)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Let control process the stale update, now that the retag has been
+	// committed, and wait for it to finish.
+	close(staleRelease)
+	select {
+	case <-staleDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for control to process the stale map update")
+	}
+
+	// The retag should stick, and the machine should stay logged in with
+	// the same node key. With the bug present, control instead expires the
+	// node key when it processes the stale update.
+	n := env.Control.Node(origKey)
+	if n == nil {
+		t.Fatalf("node %v disappeared from control", origKey.ShortString())
+	}
+	if !n.KeyExpiry.IsZero() {
+		t.Fatalf("control expired the node key after processing a stale map update; the machine was logged out (issue 20365)")
+	}
+	if got, want := n.Tags, []string{"tag:tag2"}; !slices.Equal(got, want) {
+		t.Fatalf("node tags = %v; want %v", got, want)
+	}
+	st := n1.MustStatus()
+	if st.BackendState != "Running" {
+		t.Errorf("BackendState = %q; want Running", st.BackendState)
+	}
+	if st.Self.PublicKey != origKey {
+		t.Errorf("node key changed from %v to %v; the machine was logged out and re-registered", origKey.ShortString(), st.Self.PublicKey.ShortString())
+	}
+}
+
 // Returns true if the error returned by [exec.Run] fails with a non-zero
 // exit code, false otherwise.
 func isNonZeroExitCode(err error) bool {
@@ -707,6 +849,9 @@ func TestOneNodeUpInterruptedDeviceApproval(t *testing.T) {
 }
 
 func TestConfigFileAuthKey(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("--config is unsupported by the Windows service; see #20871")
+	}
 	t.Parallel()
 	const authKey = "opensesame"
 	env := NewTestEnv(t, ConfigureControl(func(control *testcontrol.Server) {
@@ -732,6 +877,9 @@ func TestConfigFileAuthKey(t *testing.T) {
 }
 
 func TestTwoNodes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("multiple nodes need the userspace-peer harness; see #20711")
+	}
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
 
@@ -817,6 +965,9 @@ func TestTwoNodes(t *testing.T) {
 // tests two nodes where the first gets a incremental MapResponse (with only
 // PeersRemoved set) saying that the second node disappeared.
 func TestIncrementalMapUpdatePeersRemoved(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("multiple nodes need the userspace-peer harness; see #20711")
+	}
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
 
@@ -904,6 +1055,9 @@ func TestIncrementalMapUpdatePeersRemoved(t *testing.T) {
 // This covers VIP additions at runtime, where the VIP route is not reachable
 // before the map mutation but is reachable over TSMP afterward.
 func TestIncrementalMapUpdatePeerAllowedIPsReachability(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("multiple nodes need the userspace-peer harness; see #20711")
+	}
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
 
@@ -1129,6 +1283,9 @@ func TestC2NPingRequest(t *testing.T) {
 // Issue 2434: when "down" (WantRunning false), tailscaled shouldn't
 // be connected to control.
 func TestNoControlConnWhenDown(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("restarting the daemon with preserved state needs harness support; see #20750")
+	}
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
 	n1 := NewTestNode(t, env)
@@ -1196,6 +1353,9 @@ func TestOneNodeUpWindowsStyle(t *testing.T) {
 // jailed node cannot initiate connections to the other node however the other
 // node can initiate connections to the jailed node.
 func TestClientSideJailing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("multiple nodes need the userspace-peer harness; see #20711")
+	}
 	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/17419")
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
@@ -1308,6 +1468,9 @@ func TestClientSideJailing(t *testing.T) {
 // TestNATPing creates two nodes, n1 and n2, sets up masquerades for both and
 // tries to do bi-directional pings between them.
 func TestNATPing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("multiple nodes need the userspace-peer harness; see #20711")
+	}
 	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/12169")
 	tstest.Parallel(t)
 	for _, v6 := range []bool{false, true} {
@@ -1436,6 +1599,9 @@ func TestNATPing(t *testing.T) {
 }
 
 func TestLogoutRemovesAllPeers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("multiple nodes need the userspace-peer harness; see #20711")
+	}
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
 	// Spin up some nodes.
@@ -1495,6 +1661,9 @@ func TestAutoUpdateDefaults_cap(t *testing.T) { testAutoUpdateDefaults(t, true) 
 // useCap is whether to use NodeAttrDefaultAutoUpdate (as opposed to the old
 // DeprecatedDefaultAutoUpdate top-level MapResponse field).
 func testAutoUpdateDefaults(t *testing.T, useCap bool) {
+	if runtime.GOOS == "windows" {
+		t.Skip("multiple nodes need the userspace-peer harness; see #20711")
+	}
 	t.Cleanup(feature.HookCanAutoUpdate.SetForTest(func() bool { return true }))
 
 	env := NewTestEnv(t)
@@ -1531,7 +1700,7 @@ func testAutoUpdateDefaults(t *testing.T, useCap bool) {
 				if mr.Node.CapMap == nil {
 					mr.Node.CapMap = make(tailcfg.NodeCapMap)
 				}
-				mr.Node.CapMap[tailcfg.NodeAttrDefaultAutoUpdate] = []tailcfg.RawMessage{
+				mr.Node.CapMap[nodecap.DefaultAutoUpdate] = []tailcfg.RawMessage{
 					tailcfg.RawMessage(fmt.Sprintf("%t", send)),
 				}
 			} else {
@@ -1979,6 +2148,9 @@ func TestNetstackUDPLoopback(t *testing.T) {
 }
 
 func TestEncryptStateMigration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("--encrypt-state is unsupported by the Windows service; see #20872")
+	}
 	if !hostinfo.New().TPM.Present() {
 		t.Skip("TPM not available")
 	}
@@ -2039,6 +2211,9 @@ func TestEncryptStateMigration(t *testing.T) {
 // relay between all 3 nodes, and "tailscale debug peer-relay-sessions" returns
 // expected values.
 func TestPeerRelayPing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("multiple nodes need the userspace-peer harness; see #20711")
+	}
 	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/17251")
 	tstest.Parallel(t)
 
@@ -2179,6 +2354,9 @@ func TestPeerRelayPing(t *testing.T) {
 }
 
 func TestC2NDebugNetmap(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("multiple nodes need the userspace-peer harness; see #20711")
+	}
 	tstest.Parallel(t)
 	env := NewTestEnv(t, ConfigureControl(func(s *testcontrol.Server) {
 		s.CollectServices = opt.False
@@ -2317,7 +2495,9 @@ func TestC2NDebugNetmap(t *testing.T) {
 }
 
 func TestTailnetLock(t *testing.T) {
-
+	if runtime.GOOS == "windows" {
+		t.Skip("multiple nodes need the userspace-peer harness; see #20711")
+	}
 	// If you run `tailscale lock log` on a node where Tailnet Lock isn't
 	// enabled, you get an error explaining that.
 	t.Run("log-when-not-enabled", func(t *testing.T) {
@@ -2362,7 +2542,7 @@ func TestTailnetLock(t *testing.T) {
 
 		env := NewTestEnv(t)
 		env.Control.DefaultNodeCapabilities = &tailcfg.NodeCapMap{
-			tailcfg.CapabilityTailnetLock: []tailcfg.RawMessage{},
+			nodecap.TailnetLock: []tailcfg.RawMessage{},
 		}
 
 		// Start two nodes which will be our signing nodes.
@@ -2459,6 +2639,9 @@ func TestTailnetLock(t *testing.T) {
 }
 
 func TestNodeWithBadStateFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("service harness can't seed a corrupt state file before start; see #20750")
+	}
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
 	n1 := NewTestNode(t, env)

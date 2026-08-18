@@ -33,6 +33,8 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tsd"
 	"tailscale.com/tstest"
 	"tailscale.com/types/logger"
@@ -190,6 +192,34 @@ func TestGetServeHandler(t *testing.T) {
 			path: "/foo/../../../../../../../../etc/passwd",
 			want: "/",
 		},
+		// Malformed request targets that net/http hands the handler verbatim.
+		// These clean to a path.Dir fixed point ("*" or ".") that never reaches
+		// "/", and once spun the getServeHandler loop below forever (a remote
+		// serve/funnel DoS). They must resolve to not-found, not hang.
+		{
+			name: "asterisk", // "GET *"
+			conf: conf1,
+			path: "*",
+			want: "",
+		},
+		{
+			name: "empty", // "CONNECT" authority-form sets URL.Path to ""
+			conf: conf1,
+			path: "",
+			want: "",
+		},
+		{
+			name: "dot",
+			conf: conf1,
+			path: ".",
+			want: "",
+		},
+		{
+			name: "asterisk-subpath",
+			conf: conf1,
+			path: "*/foo",
+			want: "",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -209,6 +239,9 @@ func TestGetServeHandler(t *testing.T) {
 				DestPort: port,
 			}))
 
+			// A malformed target like "*" or "" once spun getServeHandler's
+			// path-walk loop forever; a regression would hang here until the
+			// package test timeout fires.
 			h, got, ok := b.getServeHandler(req)
 			if (got != "") != ok {
 				t.Fatalf("got ok=%v, but got mountPoint=%q", ok, got)
@@ -364,7 +397,7 @@ func TestServeConfigServices(t *testing.T) {
 		SelfNode: (&tailcfg.Node{
 			Name: "example.ts.net",
 			CapMap: tailcfg.NodeCapMap{
-				tailcfg.NodeAttrServiceHost: []tailcfg.RawMessage{tailcfg.RawMessage(svcIPMapJSON)},
+				nodecap.ServiceHost: []tailcfg.RawMessage{tailcfg.RawMessage(svcIPMapJSON)},
 			},
 		}).View(),
 		UserProfiles: map[tailcfg.UserID]tailcfg.UserProfileView{
@@ -862,7 +895,7 @@ func TestServeHTTPProxyGrantHeader(t *testing.T) {
 			"example.ts.net:443": {Handlers: map[string]*ipn.HTTPHandler{
 				"/": {
 					Proxy:         testServ.URL,
-					AcceptAppCaps: []tailcfg.PeerCapability{"example.com/cap/interesting", "example.com/cap/boring"},
+					AcceptAppCaps: []peercap.Cap{"example.com/cap/interesting", "example.com/cap/boring"},
 				},
 			}},
 		},

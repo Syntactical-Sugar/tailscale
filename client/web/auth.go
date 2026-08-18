@@ -18,6 +18,7 @@ import (
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 )
 
 const (
@@ -199,7 +200,8 @@ func (s *Server) controlSupportsCheckMode(ctx context.Context) bool {
 	if err != nil {
 		return true
 	}
-	return strings.HasSuffix(controlURL.Host, ".tailscale.com")
+	return strings.HasSuffix(controlURL.Host, ".tailscale.com") ||
+		controlURL.Host == "control.tailscale" // for natlab tests
 }
 
 // awaitUserAuth blocks until the given session auth has been completed
@@ -334,7 +336,7 @@ func toPeerCapabilities(status *ipnstate.Status, whois *apitype.WhoIsResponse) (
 
 	// For tagged nodes, we actually look at the granted capabilities.
 	caps := peerCapabilities{}
-	rules, err := tailcfg.UnmarshalCapJSON[capRule](whois.CapMap, tailcfg.PeerCapabilityWebUI)
+	rules, err := tailcfg.UnmarshalCapJSON[capRule](whois.CapMap, peercap.WebUI)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal capability: %v", err)
 	}

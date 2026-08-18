@@ -16,8 +16,10 @@ import (
 	"github.com/kballard/go-shellquote"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/envknob"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/util/slicesx"
 )
 
@@ -43,6 +45,13 @@ func exitNodeCmd() *ffcli.Command {
 				ShortUsage: "tailscale exit-node suggest",
 				ShortHelp:  "Suggest the best available exit node",
 				Exec:       runExitNodeSuggest,
+				FlagSet: (func() *flag.FlagSet {
+					fs := newFlagSet("suggest")
+					if buildfeatures.HasRouteCheck {
+						fs.BoolVar(&exitNodeArgs.probe, "force-probe", false, hidden+"perform a routecheck probe before suggesting")
+					}
+					return fs
+				})(),
 			}},
 			(func() []*ffcli.Command {
 				if !envknob.UseWIPCode() {
@@ -68,6 +77,7 @@ func exitNodeCmd() *ffcli.Command {
 
 var exitNodeArgs struct {
 	filter string
+	probe  bool
 }
 
 func exitNodeSetUse(wantOn bool) func(ctx context.Context, args []string) error {
@@ -148,7 +158,11 @@ func runExitNodeList(ctx context.Context, args []string) error {
 // runExitNodeSuggest returns a suggested exit node ID to connect to and shows the chosen exit node tailcfg.StableNodeID.
 // If there are no derp based exit nodes to choose from or there is a failure in finding a suggestion, the command will return an error indicating so.
 func runExitNodeSuggest(ctx context.Context, args []string) error {
-	res, err := localClient.SuggestExitNode(ctx)
+	suggestExitNode := localClient.SuggestExitNode
+	if exitNodeArgs.probe {
+		suggestExitNode = localClient.SuggestExitNodeWithProbe
+	}
+	res, err := suggestExitNode(ctx)
 	if err != nil {
 		return fmt.Errorf("suggest exit node: %w", err)
 	}
@@ -162,7 +176,7 @@ func runExitNodeSuggest(ctx context.Context, args []string) error {
 
 func hasAnyExitNodeSuggestions(peers []*ipnstate.PeerStatus) bool {
 	for _, peer := range peers {
-		if peer.HasCap(tailcfg.NodeAttrSuggestExitNode) {
+		if peer.HasCap(nodecap.SuggestExitNode) {
 			return true
 		}
 	}

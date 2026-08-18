@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"maps"
 	"math"
 	"net"
@@ -49,6 +50,7 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tsd"
 	"tailscale.com/tstest"
 	"tailscale.com/tstest/deptest"
@@ -71,7 +73,10 @@ import (
 	"tailscale.com/util/set"
 	"tailscale.com/util/syspolicy"
 	"tailscale.com/util/syspolicy/pkey"
+	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/util/syspolicy/policytest"
+	"tailscale.com/util/syspolicy/rsop"
+	"tailscale.com/util/syspolicy/setting"
 	"tailscale.com/util/syspolicy/source"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
@@ -183,135 +188,6 @@ func TestShrinkDefaultRoute(t *testing.T) {
 				t.Errorf("shrink(%q).Contains(%v) = %v, want %v", test.route, ip, gotContains, want)
 			}
 		}
-	}
-}
-
-func TestPeerRoutes(t *testing.T) {
-	pp := netip.MustParsePrefix
-	tests := []struct {
-		name  string
-		peers []wgcfg.Peer
-		want  []netip.Prefix
-	}{
-		{
-			name: "small_v4",
-			peers: []wgcfg.Peer{
-				{
-					AllowedIPs: []netip.Prefix{
-						pp("100.101.102.103/32"),
-					},
-				},
-			},
-			want: []netip.Prefix{
-				pp("100.101.102.103/32"),
-			},
-		},
-		{
-			name: "big_v4",
-			peers: []wgcfg.Peer{
-				{
-					AllowedIPs: []netip.Prefix{
-						pp("100.101.102.103/32"),
-						pp("100.101.102.104/32"),
-						pp("100.101.102.105/32"),
-					},
-				},
-			},
-			want: []netip.Prefix{
-				pp("100.64.0.0/10"),
-			},
-		},
-		{
-			name: "has_1_v6",
-			peers: []wgcfg.Peer{
-				{
-					AllowedIPs: []netip.Prefix{
-						pp("fd7a:115c:a1e0:ab12:4843:cd96:6258:b240/128"),
-					},
-				},
-			},
-			want: []netip.Prefix{
-				pp("fd7a:115c:a1e0::/48"),
-			},
-		},
-		{
-			name: "has_2_v6",
-			peers: []wgcfg.Peer{
-				{
-					AllowedIPs: []netip.Prefix{
-						pp("fd7a:115c:a1e0:ab12:4843:cd96:6258:b240/128"),
-						pp("fd7a:115c:a1e0:ab12:4843:cd96:6258:b241/128"),
-					},
-				},
-			},
-			want: []netip.Prefix{
-				pp("fd7a:115c:a1e0::/48"),
-			},
-		},
-		{
-			name: "big_v4_big_v6",
-			peers: []wgcfg.Peer{
-				{
-					AllowedIPs: []netip.Prefix{
-						pp("100.101.102.103/32"),
-						pp("100.101.102.104/32"),
-						pp("100.101.102.105/32"),
-						pp("fd7a:115c:a1e0:ab12:4843:cd96:6258:b240/128"),
-						pp("fd7a:115c:a1e0:ab12:4843:cd96:6258:b241/128"),
-					},
-				},
-			},
-			want: []netip.Prefix{
-				pp("100.64.0.0/10"),
-				pp("fd7a:115c:a1e0::/48"),
-			},
-		},
-		{
-			name: "output-should-be-sorted",
-			peers: []wgcfg.Peer{
-				{
-					AllowedIPs: []netip.Prefix{
-						pp("100.64.0.2/32"),
-						pp("10.0.0.0/16"),
-					},
-				},
-				{
-					AllowedIPs: []netip.Prefix{
-						pp("100.64.0.1/32"),
-						pp("10.0.0.0/8"),
-					},
-				},
-			},
-			want: []netip.Prefix{
-				pp("10.0.0.0/8"),
-				pp("10.0.0.0/16"),
-				pp("100.64.0.1/32"),
-				pp("100.64.0.2/32"),
-			},
-		},
-		{
-			name: "skip-unmasked-prefixes",
-			peers: []wgcfg.Peer{
-				{
-					PublicKey: key.NewNode().Public(),
-					AllowedIPs: []netip.Prefix{
-						pp("100.64.0.2/32"),
-						pp("10.0.0.100/16"),
-					},
-				},
-			},
-			want: []netip.Prefix{
-				pp("100.64.0.2/32"),
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := peerRoutes(t.Logf, tt.peers, 2, true)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("got = %v; want %v", got, tt.want)
-			}
-		})
 	}
 }
 
@@ -798,7 +674,7 @@ func TestUpdateNetMapCache(t *testing.T) {
 
 	// Now enable the netmap caching attribute, and send another update.
 	// After doing so, the cache should have real data in it.
-	testMap.AllCaps = set.Of(tailcfg.NodeAttrCacheNetworkMaps)
+	testMap.AllCaps = set.Of(nodecap.CacheNetworkMaps)
 
 	clb.mu.Lock()
 	clb.setNetMapLocked(testMap)
@@ -1419,7 +1295,7 @@ func TestConfigureExitNode(t *testing.T) {
 			sys := tsd.NewSystem()
 			sys.PolicyClient.Set(pol)
 			lb := newTestLocalBackendWithSys(t, sys)
-			lb.SetPrefsForTest(tt.prefs.Clone())
+			lb.ForTest().SetPrefs(tt.prefs.Clone())
 
 			// Then set the netcheck report and netmap, if any. Clone the shared
 			// report because AddNetcheckReportForTest mutates it and subtests run
@@ -1643,9 +1519,9 @@ func TestPrefsChangeDisablesExitNode(t *testing.T) {
 			if tt.netMap != nil {
 				lb.SetControlClientStatus(lb.cc, controlclient.Status{NetMap: tt.netMap})
 			}
-			// Set the initial prefs via SetPrefsForTest
+			// Set the initial prefs via the test helper.
 			// to apply necessary adjustments.
-			lb.SetPrefsForTest(tt.prefs.Clone())
+			lb.ForTest().SetPrefs(tt.prefs.Clone())
 			initialPrefs := lb.Prefs()
 
 			// Check whether changeDisablesExitNodeLocked correctly identifies the change.
@@ -1684,7 +1560,7 @@ func TestExitNodeNotifyOrder(t *testing.T) {
 
 	lb := newTestLocalBackend(t)
 	lb.sys.MagicSock.Get().AddNetcheckReportForTest(clientNetmap.DERPMap, report, time.Now())
-	lb.SetPrefsForTest(&ipn.Prefs{
+	lb.ForTest().SetPrefs(&ipn.Prefs{
 		ControlURL:   controlURL,
 		AutoExitNode: ipn.AnyExitNode,
 	})
@@ -1929,7 +1805,7 @@ func TestStatusPeerCapabilities(t *testing.T) {
 	tests := []struct {
 		name                     string
 		peers                    []tailcfg.NodeView
-		expectedPeerCapabilities map[tailcfg.StableNodeID][]tailcfg.NodeCapability
+		expectedPeerCapabilities map[tailcfg.StableNodeID][]nodecap.Cap
 		expectedPeerCapMap       map[tailcfg.StableNodeID]tailcfg.NodeCapMap
 	}{
 		{
@@ -1941,9 +1817,9 @@ func TestStatusPeerCapabilities(t *testing.T) {
 					Key:             makeNodeKeyFromID(1),
 					IsWireGuardOnly: true,
 					Hostinfo:        (&tailcfg.Hostinfo{}).View(),
-					Capabilities:    []tailcfg.NodeCapability{tailcfg.CapabilitySSH},
-					CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
-						tailcfg.CapabilitySSH: nil,
+					Capabilities:    []nodecap.Cap{nodecap.SSH},
+					CapMap: (tailcfg.NodeCapMap)(map[nodecap.Cap][]tailcfg.RawMessage{
+						nodecap.SSH: nil,
 					}),
 				}).View(),
 				(&tailcfg.Node{
@@ -1951,9 +1827,9 @@ func TestStatusPeerCapabilities(t *testing.T) {
 					StableID:     "bar",
 					Key:          makeNodeKeyFromID(2),
 					Hostinfo:     (&tailcfg.Hostinfo{}).View(),
-					Capabilities: []tailcfg.NodeCapability{tailcfg.CapabilityAdmin},
-					CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
-						tailcfg.CapabilityAdmin: {`{"test": "true}`},
+					Capabilities: []nodecap.Cap{nodecap.Admin},
+					CapMap: (tailcfg.NodeCapMap)(map[nodecap.Cap][]tailcfg.RawMessage{
+						nodecap.Admin: {`{"test": "true}`},
 					}),
 				}).View(),
 				(&tailcfg.Node{
@@ -1961,26 +1837,26 @@ func TestStatusPeerCapabilities(t *testing.T) {
 					StableID:     "baz",
 					Key:          makeNodeKeyFromID(3),
 					Hostinfo:     (&tailcfg.Hostinfo{}).View(),
-					Capabilities: []tailcfg.NodeCapability{tailcfg.CapabilityOwner},
-					CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
-						tailcfg.CapabilityOwner: nil,
+					Capabilities: []nodecap.Cap{nodecap.Owner},
+					CapMap: (tailcfg.NodeCapMap)(map[nodecap.Cap][]tailcfg.RawMessage{
+						nodecap.Owner: nil,
 					}),
 				}).View(),
 			},
-			expectedPeerCapabilities: map[tailcfg.StableNodeID][]tailcfg.NodeCapability{
-				tailcfg.StableNodeID("foo"): {tailcfg.CapabilitySSH},
-				tailcfg.StableNodeID("bar"): {tailcfg.CapabilityAdmin},
-				tailcfg.StableNodeID("baz"): {tailcfg.CapabilityOwner},
+			expectedPeerCapabilities: map[tailcfg.StableNodeID][]nodecap.Cap{
+				tailcfg.StableNodeID("foo"): {nodecap.SSH},
+				tailcfg.StableNodeID("bar"): {nodecap.Admin},
+				tailcfg.StableNodeID("baz"): {nodecap.Owner},
 			},
 			expectedPeerCapMap: map[tailcfg.StableNodeID]tailcfg.NodeCapMap{
-				tailcfg.StableNodeID("foo"): (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
-					tailcfg.CapabilitySSH: nil,
+				tailcfg.StableNodeID("foo"): (tailcfg.NodeCapMap)(map[nodecap.Cap][]tailcfg.RawMessage{
+					nodecap.SSH: nil,
 				}),
-				tailcfg.StableNodeID("bar"): (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
-					tailcfg.CapabilityAdmin: {`{"test": "true}`},
+				tailcfg.StableNodeID("bar"): (tailcfg.NodeCapMap)(map[nodecap.Cap][]tailcfg.RawMessage{
+					nodecap.Admin: {`{"test": "true}`},
 				}),
-				tailcfg.StableNodeID("baz"): (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
-					tailcfg.CapabilityOwner: nil,
+				tailcfg.StableNodeID("baz"): (tailcfg.NodeCapMap)(map[nodecap.Cap][]tailcfg.RawMessage{
+					nodecap.Owner: nil,
 				}),
 			},
 		},
@@ -2120,8 +1996,7 @@ func TestWatchNotificationsCallbacks(t *testing.T) {
 
 func TestWatchNotificationsClosesSlowConsumer(t *testing.T) {
 	b := newTestLocalBackend(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	watchAdded := make(chan struct{})
 	firstNotify := make(chan struct{}, 1)
@@ -2749,7 +2624,7 @@ func TestNotifyForSessionUserProfilesDedupResetsOnSelfChange(t *testing.T) {
 // tests LocalBackend.updateNetmapDeltaLocked
 func TestUpdateNetmapDelta(t *testing.T) {
 	b := newTestLocalBackend(t)
-	if b.currentNode().UpdateNetmapDelta(nil) {
+	if _, handled := b.currentNode().UpdateNetmapDelta(nil); handled {
 		t.Errorf("updateNetmapDeltaLocked() = true, want false with nil netmap")
 	}
 
@@ -2788,7 +2663,7 @@ func TestUpdateNetmapDelta(t *testing.T) {
 		t.Fatal("netmap.MutationsFromMapResponse failed")
 	}
 
-	if !b.currentNode().UpdateNetmapDelta(muts) {
+	if _, handled := b.currentNode().UpdateNetmapDelta(muts); !handled {
 		t.Fatalf("updateNetmapDeltaLocked() = false, want true with new netmap")
 	}
 
@@ -2904,6 +2779,7 @@ func TestWhoIs(t *testing.T) {
 		{"round1MyselfWithPort", "100.101.102.103:123", 1, "Myself", nil},
 		{"round1Peer2NoPort", "100.200.200.200:0", 2, "Peer2", []string{"group:foo"}},
 		{"round1Peer2WithPort", "100.200.200.200:123", 2, "Peer2", []string{"group:foo"}},
+		{"round1Peer2Mapped4in6", "[::ffff:100.200.200.200]:123", 2, "Peer2", []string{"group:foo"}},
 		{"round1UnknownPeer", "100.4.0.4:404", 0, "", nil},
 	}
 	expectWhois(t, testsRound1, b)
@@ -3493,7 +3369,7 @@ func TestCoveredRouteRangeNoDefault(t *testing.T) {
 
 func TestReconfigureAppConnector(t *testing.T) {
 	b := newTestBackend(t)
-	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.currentNode().Self(), b.pm.prefs)
 	if b.appConnector != nil {
 		t.Fatal("unexpected app connector")
 	}
@@ -3506,7 +3382,7 @@ func TestReconfigureAppConnector(t *testing.T) {
 		},
 		AppConnectorSet: true,
 	})
-	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.currentNode().Self(), b.pm.prefs)
 	if b.appConnector == nil {
 		t.Fatal("expected app connector")
 	}
@@ -3521,7 +3397,7 @@ func TestReconfigureAppConnector(t *testing.T) {
 		SelfNode: (&tailcfg.Node{
 			Name: "example.ts.net",
 			Tags: []string{"tag:example"},
-			CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+			CapMap: (tailcfg.NodeCapMap)(map[nodecap.Cap][]tailcfg.RawMessage{
 				"tailscale.com/app-connectors": {tailcfg.RawMessage(appCfg)},
 			}),
 		}).View(),
@@ -3529,7 +3405,7 @@ func TestReconfigureAppConnector(t *testing.T) {
 
 	b.currentNode().SetNetMap(nm)
 
-	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.currentNode().Self(), b.pm.prefs)
 	b.appConnector.Wait(context.Background())
 
 	want := []string{"example.com"}
@@ -3549,7 +3425,7 @@ func TestReconfigureAppConnector(t *testing.T) {
 		},
 		AppConnectorSet: true,
 	})
-	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.currentNode().Self(), b.pm.prefs)
 	if b.appConnector != nil {
 		t.Fatal("expected no app connector")
 	}
@@ -3581,7 +3457,7 @@ func TestBackfillAppConnectorRoutes(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.currentNode().Self(), b.pm.prefs)
 
 	// Smoke check that AdvertiseRoutes doesn't have the test IP.
 	ip := netip.MustParseAddr("1.2.3.4")
@@ -3602,7 +3478,7 @@ func TestBackfillAppConnectorRoutes(t *testing.T) {
 
 	// Mimic b.authReconfigure for the app connector bits.
 	b.mu.Lock()
-	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.currentNode().Self(), b.pm.prefs)
 	b.mu.Unlock()
 	b.readvertiseAppConnectorRoutes()
 
@@ -3969,11 +3845,11 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 				t.Errorf("wanted prefs changed %v, got prefs changed %v", test.prefsChanged, changed)
 			}
 
-			// Both [LocalBackend.SetPrefsForTest] and [LocalBackend.EditPrefs]
+			// Both [forTest.SetPrefs] and [LocalBackend.EditPrefs]
 			// apply syspolicy settings to the current profile's preferences. Therefore,
 			// we pass the current, unmodified preferences and expect the effective
 			// preferences to change.
-			b.SetPrefsForTest(pm.CurrentPrefs().AsStruct())
+			b.ForTest().SetPrefs(pm.CurrentPrefs().AsStruct())
 
 			if got := b.Prefs().ExitNodeID(); got != tailcfg.StableNodeID(test.exitNodeIDWant) {
 				t.Errorf("ExitNodeID: got %q; want %q", got, test.exitNodeIDWant)
@@ -4093,7 +3969,7 @@ func TestUpdateNetmapDeltaAutoExitNode(t *testing.T) {
 			b.currentNode().SetNetMap(tt.netmap)
 			b.lastSuggestedExitNode = tt.lastSuggestedExitNode
 			b.sys.MagicSock.Get().AddNetcheckReportForTest(derpMap, tt.report, time.Now())
-			b.SetPrefsForTest(b.pm.CurrentPrefs().AsStruct())
+			b.ForTest().SetPrefs(b.pm.CurrentPrefs().AsStruct())
 
 			allDone := make(chan bool, 1)
 			defer b.goTracker.AddDoneCallback(func() {
@@ -4221,7 +4097,7 @@ func TestAutoExitNodeSetNetInfoCallback(t *testing.T) {
 		DERPMap: defaultDERPMap,
 	})
 	b.lastSuggestedExitNode = peer1.StableID()
-	b.SetPrefsForTest(b.pm.CurrentPrefs().AsStruct())
+	b.ForTest().SetPrefs(b.pm.CurrentPrefs().AsStruct())
 	if eid := b.Prefs().ExitNodeID(); eid != peer1.StableID() {
 		t.Errorf("got initial exit node %v, want %v", eid, peer1.StableID())
 	}
@@ -4291,7 +4167,7 @@ func TestSetControlClientStatusAutoExitNode(t *testing.T) {
 	// in terms of latency and DERP region.
 	b.lastSuggestedExitNode = peer2.StableID()
 	b.sys.MagicSock.Get().AddNetcheckReportForTest(derpMap, report, time.Now())
-	b.SetPrefsForTest(b.pm.CurrentPrefs().AsStruct())
+	b.ForTest().SetPrefs(b.pm.CurrentPrefs().AsStruct())
 	offlinePeer2 := makePeer(2, withCap(26), withSuggest(), withExitRoutes(), withOnline(false), withNodeKey())
 	updatedNetmap := &netmap.NetworkMap{
 		Peers: []tailcfg.NodeView{
@@ -4879,7 +4755,7 @@ func TestTCPHandlerForDstWithVIPService(t *testing.T) {
 			SelfNode: (&tailcfg.Node{
 				Name: "example.ts.net",
 				CapMap: tailcfg.NodeCapMap{
-					tailcfg.NodeAttrServiceHost: []tailcfg.RawMessage{tailcfg.RawMessage(svcIPMapJSON)},
+					nodecap.ServiceHost: []tailcfg.RawMessage{tailcfg.RawMessage(svcIPMapJSON)},
 				},
 			}).View(),
 			UserProfiles: map[tailcfg.UserID]tailcfg.UserProfileView{
@@ -5259,7 +5135,7 @@ func TestDriveManageShares(t *testing.T) {
 			if !tt.disabled {
 				nm := new(*b.currentNode().NetMap())
 				self := nm.SelfNode.AsStruct()
-				self.CapMap = tailcfg.NodeCapMap{tailcfg.NodeAttrsTaildriveShare: nil}
+				self.CapMap = tailcfg.NodeCapMap{nodecap.TaildriveShare: nil}
 				nm.SelfNode = self.View()
 				b.currentNode().SetNetMap(nm)
 				b.sys.Set(driveimpl.NewFileSystemForRemote(b.logf))
@@ -5389,15 +5265,6 @@ func TestRoundTraffic(t *testing.T) {
 	}
 }
 
-func (b *LocalBackend) SetPrefsForTest(newp *ipn.Prefs) {
-	if newp == nil {
-		panic("SetPrefsForTest got nil prefs")
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.setPrefsLocked(newp)
-}
-
 type peerOptFunc func(*tailcfg.Node)
 
 func makePeer(id tailcfg.NodeID, opts ...peerOptFunc) tailcfg.NodeView {
@@ -5474,7 +5341,7 @@ func withExitRoutes() peerOptFunc {
 
 func withSuggest() peerOptFunc {
 	return func(n *tailcfg.Node) {
-		mak.Set(&n.CapMap, tailcfg.NodeAttrSuggestExitNode, []tailcfg.RawMessage{})
+		mak.Set(&n.CapMap, nodecap.SuggestExitNode, []tailcfg.RawMessage{})
 	}
 }
 
@@ -5499,6 +5366,12 @@ func withNodeKey() peerOptFunc {
 func withAddresses(addresses ...netip.Prefix) peerOptFunc {
 	return func(n *tailcfg.Node) {
 		n.Addresses = append(n.Addresses, addresses...)
+	}
+}
+
+func withAllowedIPs(prefixes ...netip.Prefix) peerOptFunc {
+	return func(n *tailcfg.Node) {
+		n.AllowedIPs = append(n.AllowedIPs, prefixes...)
 	}
 }
 
@@ -6067,7 +5940,7 @@ func TestSuggestExitNode(t *testing.T) {
 				regionLatency = tt.lastReport.RegionLatency
 			}
 
-			got, err := suggestExitNode(preferredDERP, regionLatency, nb, tt.lastSuggestion, selectRegion, selectNode, allowList)
+			got, err := suggestExitNode(preferredDERP, regionLatency, nil, nb, tt.lastSuggestion, selectRegion, selectNode, allowList)
 			if got.Name != tt.wantName {
 				t.Errorf("name=%v, want %v", got.Name, tt.wantName)
 			}
@@ -6302,7 +6175,7 @@ func TestSuggestExitNodeTrafficSteering(t *testing.T) {
 			netip.MustParsePrefix("fe70::1/128"),
 		},
 		CapMap: tailcfg.NodeCapMap{
-			tailcfg.NodeAttrTrafficSteering: []tailcfg.RawMessage{},
+			nodecap.TrafficSteering: []tailcfg.RawMessage{},
 		},
 	}
 
@@ -6398,8 +6271,8 @@ func TestSuggestExitNodeTrafficSteering(t *testing.T) {
 				},
 			},
 			// Change this, if the hashing function changes.
-			wantID:   "stable1",
-			wantName: "peer1",
+			wantID:   "stable4",
+			wantName: "peer4",
 		},
 		{
 			name: "exit-nodes-without-priority-for-suggestions",
@@ -6417,8 +6290,9 @@ func TestSuggestExitNodeTrafficSteering(t *testing.T) {
 						withLocationPriority(1)),
 				},
 			},
-			wantID:   "stable1",
-			wantName: "peer1",
+			// Change this, if the hashing function changes.
+			wantID:   "stable2",
+			wantName: "peer2",
 			wantPri:  0,
 		},
 		{
@@ -6540,8 +6414,8 @@ func TestSuggestExitNodeTrafficSteering(t *testing.T) {
 				},
 			},
 			// Change this, if the hashing function changes.
-			wantID:   "stable2",
-			wantName: "peer2",
+			wantID:   "stable7",
+			wantName: "peer7",
 			wantPri:  2,
 		},
 		{
@@ -6625,7 +6499,7 @@ func TestSuggestExitNodeTrafficSteering(t *testing.T) {
 			defer nb.shutdown(errShutdown)
 			nb.SetNetMap(tt.netMap)
 
-			got, err := suggestExitNodeUsingTrafficSteering(nb, allowList)
+			got, err := suggestExitNodeUsingTrafficSteering(nil, nb, allowList)
 			if tt.wantErr == nil && err != nil {
 				t.Fatalf("err=%v, want nil", err)
 			}
@@ -7079,7 +6953,7 @@ func newLocalBackendWithSysAndTestControl(t testing.TB, enableLogging bool, sys 
 	}
 	t.Cleanup(b.Shutdown)
 
-	b.SetControlClientGetterForTesting(func(opts controlclient.Options) (controlclient.Client, error) {
+	b.ForTest().SetControlClientGetter(func(opts controlclient.Options) (controlclient.Client, error) {
 		return newControl(t, opts), nil
 	})
 	return b
@@ -7490,6 +7364,78 @@ func TestConfigFileReload(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "enable_relay_server",
+			initial: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version: "alpha0",
+				},
+			},
+			updated: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version:                    "alpha0",
+					RelayServerPort:            new(uint16(12345)),
+					RelayServerStaticEndpoints: []netip.AddrPort{netip.MustParseAddrPort("[2001:db8::1]:40000")},
+				},
+			},
+			checkFn: func(t *testing.T, b *LocalBackend) {
+				pv := b.Prefs()
+				if port, ok := pv.RelayServerPort().GetOk(); !ok || port != 12345 {
+					t.Errorf("RelayServerPort = (%d, %v); want (12345, true)", port, ok)
+				}
+				if got := pv.RelayServerStaticEndpoints().AsSlice(); !slices.Equal(got, []netip.AddrPort{netip.MustParseAddrPort("[2001:db8::1]:40000")}) {
+					t.Errorf("RelayServerStaticEndpoints = %v; want [[2001:db8::1]:40000]", got)
+				}
+			},
+		},
+		{
+			// Disabling: a config that omits the relay server fields
+			// must clear any previously configured values, because
+			// ToPrefs sets the masks unconditionally.
+			name: "disable_relay_server",
+			initial: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version:                    "alpha0",
+					RelayServerPort:            new(uint16(12345)),
+					RelayServerStaticEndpoints: []netip.AddrPort{netip.MustParseAddrPort("[2001:db8::1]:40000")},
+				},
+			},
+			updated: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version: "alpha0",
+				},
+			},
+			checkFn: func(t *testing.T, b *LocalBackend) {
+				pv := b.Prefs()
+				if _, ok := pv.RelayServerPort().GetOk(); ok {
+					t.Errorf("RelayServerPort = %v; want disabled", pv.RelayServerPort())
+				}
+				if got := pv.RelayServerStaticEndpoints().AsSlice(); len(got) != 0 {
+					t.Errorf("RelayServerStaticEndpoints = %v; want empty", got)
+				}
+			},
+		},
+		{
+			name: "change_relay_server_port",
+			initial: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version:         "alpha0",
+					RelayServerPort: new(uint16(12345)),
+				},
+			},
+			updated: &conffile.Config{
+				Parsed: ipn.ConfigVAlpha{
+					Version:         "alpha0",
+					RelayServerPort: new(uint16(54321)),
+				},
+			},
+			checkFn: func(t *testing.T, b *LocalBackend) {
+				pv := b.Prefs()
+				if port, ok := pv.RelayServerPort().GetOk(); !ok || port != 54321 {
+					t.Errorf("RelayServerPort = (%d, %v); want (54321, true)", port, ok)
+				}
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -7801,7 +7747,7 @@ func TestUpdatePrefsOnSysPolicyChange(t *testing.T) {
 				return newClient(tb, opts)
 			})
 			if tt.initialPrefs != nil {
-				lb.SetPrefsForTest(tt.initialPrefs)
+				lb.ForTest().SetPrefs(tt.initialPrefs)
 			}
 			if err := lb.Start(ipn.Options{}); err != nil {
 				t.Fatalf("(*LocalBackend).Start(): %v", err)
@@ -8071,7 +8017,7 @@ func TestSrcCapPacketFilter(t *testing.T) {
 		},
 		PacketFilter: []filtertype.Match{{
 			IPProto: views.SliceOf([]ipproto.Proto{ipproto.TCP}),
-			SrcCaps: []tailcfg.NodeCapability{"cap-X"}, // cap in packet filter rule
+			SrcCaps: []nodecap.Cap{"cap-X"}, // cap in packet filter rule
 			Dsts: []filtertype.NetPortRange{{
 				Net: netip.MustParsePrefix("1.1.1.1/32"),
 				Ports: filtertype.PortRange{
@@ -8082,7 +8028,7 @@ func TestSrcCapPacketFilter(t *testing.T) {
 		}},
 	}})
 
-	f := lb.GetFilterForTest()
+	f := lb.ForTest().GetFilter()
 	res := f.Check(netip.MustParseAddr("2.2.2.2"), netip.MustParseAddr("1.1.1.1"), 22, ipproto.TCP)
 	if res != filter.Accept {
 		t.Errorf("Check(2.2.2.2, ...) = %s, want %s", res, filter.Accept)
@@ -8091,6 +8037,165 @@ func TestSrcCapPacketFilter(t *testing.T) {
 	res = f.Check(netip.MustParseAddr("3.3.3.3"), netip.MustParseAddr("1.1.1.1"), 22, ipproto.TCP)
 	if !res.IsDrop() {
 		t.Error("IsDrop() for node without cap = false, want true")
+	}
+}
+
+func TestSrcCapPacketFilterUnsignedPeer(t *testing.T) {
+	lb := newLocalBackendWithTestControl(t, false, func(tb testing.TB, opts controlclient.Options) controlclient.Client {
+		return newClient(tb, opts)
+	})
+	if err := lb.Start(ipn.Options{}); err != nil {
+		t.Fatalf("(*LocalBackend).Start(): %v", err)
+	}
+
+	var signedKey, unsignedKey key.NodePublic
+	must.Do(signedKey.UnmarshalText([]byte("nodekey:5c8f86d5fc70d924e55f02446165a5dae8f822994ad26bcf4b08fd841f9bf261")))
+	must.Do(unsignedKey.UnmarshalText([]byte("nodekey:6c8f86d5fc70d924e55f02446165a5dae8f822994ad26bcf4b08fd841f9bf262")))
+
+	controlClient := lb.cc.(*mockControl)
+	controlClient.send(sendOpt{nm: &netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			Addresses: []netip.Prefix{netip.MustParsePrefix("1.1.1.1/32")},
+		}).View(),
+		Peers: []tailcfg.NodeView{
+			// A normal (signed) peer holding cap-X: it should be accepted.
+			(&tailcfg.Node{
+				Addresses: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
+				ID:        2,
+				Key:       signedKey,
+				CapMap:    tailcfg.NodeCapMap{"cap-X": nil},
+			}).View(),
+			// An unsigned peer that control has also granted cap-X: it must be
+			// dropped despite holding the capability, because tailnet lock does
+			// not trust it.
+			(&tailcfg.Node{
+				Addresses:           []netip.Prefix{netip.MustParsePrefix("3.3.3.3/32")},
+				ID:                  3,
+				Key:                 unsignedKey,
+				UnsignedPeerAPIOnly: true,
+				CapMap:              tailcfg.NodeCapMap{"cap-X": nil},
+			}).View(),
+		},
+		PacketFilter: []filtertype.Match{{
+			IPProto: views.SliceOf([]ipproto.Proto{ipproto.TCP}),
+			SrcCaps: []nodecap.Cap{"cap-X"},
+			Dsts: []filtertype.NetPortRange{{
+				Net: netip.MustParsePrefix("1.1.1.1/32"),
+				Ports: filtertype.PortRange{
+					First: 22,
+					Last:  22,
+				},
+			}},
+		}},
+	}})
+
+	f := lb.ForTest().GetFilter()
+
+	// The signed peer with the capability is accepted
+	if res := f.Check(netip.MustParseAddr("2.2.2.2"), netip.MustParseAddr("1.1.1.1"), 22, ipproto.TCP); res != filter.Accept {
+		t.Errorf("Check(signed 2.2.2.2, ...) = %s, want %s", res, filter.Accept)
+	}
+
+	// The unsigned peer with the same capability is dropped
+	if res := f.Check(netip.MustParseAddr("3.3.3.3"), netip.MustParseAddr("1.1.1.1"), 22, ipproto.TCP); !res.IsDrop() {
+		t.Errorf("Check(unsigned 3.3.3.3, ...) = %s, want drop", res)
+	}
+
+	// Directly exercise the runtime capability test used by the filter
+	if lb.srcIPHasCapForFilter(netip.MustParseAddr("3.3.3.3"), "cap-X") {
+		t.Error("srcIPHasCapForFilter returned true for UnsignedPeerAPIOnly peer")
+	}
+	if !lb.srcIPHasCapForFilter(netip.MustParseAddr("2.2.2.2"), "cap-X") {
+		t.Error("srcIPHasCapForFilter returned false for signed peer with cap")
+	}
+}
+
+// TestCapsGrantPacketFilterUnsignedPeer verifies that a CapGrant-style packet filter match
+// (Srcs + Caps, no Dsts) whose broad Srcs covers an unsigned peer's AllowedIPs does NOT cause
+// the packet filter to be discarded: a grant alone permits no traffic, so legitimate rules for
+// signed peers must keep working.
+func TestCapsGrantPacketFilterUnsignedPeer(t *testing.T) {
+	lb := newLocalBackendWithTestControl(t, false, func(tb testing.TB, opts controlclient.Options) controlclient.Client {
+		return newClient(tb, opts)
+	})
+	if err := lb.Start(ipn.Options{}); err != nil {
+		t.Fatalf("(*LocalBackend).Start(): %v", err)
+	}
+
+	var signedKey, unsignedKey key.NodePublic
+	must.Do(signedKey.UnmarshalText([]byte("nodekey:5c8f86d5fc70d924e55f02446165a5dae8f822994ad26bcf4b08fd841f9bf261")))
+	must.Do(unsignedKey.UnmarshalText([]byte("nodekey:6c8f86d5fc70d924e55f02446165a5dae8f822994ad26bcf4b08fd841f9bf262")))
+
+	controlClient := lb.cc.(*mockControl)
+	// Send a netmap with:
+	//  - a broad CapGrant-style match (Srcs 0.0.0.0/0) covering both peers
+	//  - a legitimate traffic rule for the signed peer
+	controlClient.send(sendOpt{nm: &netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			Addresses: []netip.Prefix{netip.MustParsePrefix("1.1.1.1/32")},
+		}).View(),
+		Peers: []tailcfg.NodeView{
+			(&tailcfg.Node{
+				Addresses:  []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
+				AllowedIPs: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
+				ID:         2,
+				Key:        signedKey,
+			}).View(),
+			(&tailcfg.Node{
+				Addresses:           []netip.Prefix{netip.MustParsePrefix("3.3.3.3/32")},
+				AllowedIPs:          []netip.Prefix{netip.MustParsePrefix("3.3.3.3/32")},
+				ID:                  3,
+				Key:                 unsignedKey,
+				UnsignedPeerAPIOnly: true,
+			}).View(),
+		},
+		PacketFilter: []filtertype.Match{
+			{
+				// Broad grant covering both peers: must NOT trigger vetting
+				Srcs: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")},
+				Caps: []filtertype.CapMatch{{
+					Dst: netip.MustParsePrefix("1.1.1.1/32"),
+					Cap: "cap-X",
+				}},
+			},
+			{
+				// Legitimate traffic rule for the signed peer
+				IPProto: views.SliceOf([]ipproto.Proto{ipproto.TCP}),
+				Srcs:    []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
+				Dsts: []filtertype.NetPortRange{{
+					Net:   netip.MustParsePrefix("1.1.1.1/32"),
+					Ports: filtertype.PortRange{First: 22, Last: 22},
+				}},
+			},
+		},
+	}})
+
+	f := lb.ForTest().GetFilter()
+
+	// The filter must be installed, not discarded: the signed peer's legitimate traffic rule accepts traffic
+	if res := f.Check(netip.MustParseAddr("2.2.2.2"), netip.MustParseAddr("1.1.1.1"), 22, ipproto.TCP); res != filter.Accept {
+		t.Errorf("Check(signed 2.2.2.2, ...) = %s, want %s (filter must not be discarded for a caps-only grant)", res, filter.Accept)
+	}
+
+	// The unsigned peer has no traffic rule, so its packets are dropped
+	if res := f.Check(netip.MustParseAddr("3.3.3.3"), netip.MustParseAddr("1.1.1.1"), 22, ipproto.TCP); !res.IsDrop() {
+		t.Errorf("Check(unsigned 3.3.3.3, ...) = %s, want drop", res)
+	}
+
+	// The unsigned peer is denied the granted capability at resolution time
+	if caps := lb.PeerCapsForIP(netip.MustParseAddr("3.3.3.3"), netip.MustParseAddr("1.1.1.1")); len(caps) != 0 {
+		t.Errorf("PeerCapsForIP(unsigned src) = %v, want empty", caps)
+	}
+	if caps := lb.PeerCaps(netip.MustParseAddr("3.3.3.3")); len(caps) != 0 {
+		t.Errorf("PeerCaps(unsigned src) = %v, want empty", caps)
+	}
+
+	// The signed peer keeps its grant: legitimate functionality is unaffected
+	if caps := lb.PeerCapsForIP(netip.MustParseAddr("2.2.2.2"), netip.MustParseAddr("1.1.1.1")); !caps.HasCapability("cap-X") {
+		t.Errorf("PeerCapsForIP(signed src) missing cap-X: %v", caps)
+	}
+	if caps := lb.PeerCaps(netip.MustParseAddr("2.2.2.2")); !caps.HasCapability("cap-X") {
+		t.Errorf("PeerCaps(signed src) missing cap-X: %v", caps)
 	}
 }
 
@@ -8234,7 +8339,7 @@ func TestDisplayMessageIPNBus(t *testing.T) {
 					if ok {
 						if diff := cmp.Diff(tt.wantWarning, got, cmpopts.IgnoreFields(health.UnhealthyState{}, "ETag")); diff != "" {
 							t.Errorf("unexpected warning details (-want/+got):\n%s", diff)
-							return true // we failed the test so tell the watcher we've seen what we need to to stop it waiting
+							return true // we failed the test so tell the watcher we've seen what we need to stop it waiting
 						}
 					} else {
 						got := slices.Collect(maps.Keys(n.Health.Warnings))
@@ -8244,7 +8349,7 @@ func TestDisplayMessageIPNBus(t *testing.T) {
 				},
 			}})
 
-			lb.SetPrefsForTest(&ipn.Prefs{
+			lb.ForTest().SetPrefs(&ipn.Prefs{
 				ControlURL:  "https://localhost:1/",
 				WantRunning: true,
 				LoggedOut:   false,
@@ -8314,7 +8419,7 @@ func TestOnClientVersionRespectsAutoUpdateCheck(t *testing.T) {
 	}
 
 	// With Check disabled, onClientVersion should cache but not broadcast.
-	lb.SetPrefsForTest(&ipn.Prefs{
+	lb.ForTest().SetPrefs(&ipn.Prefs{
 		AutoUpdate: ipn.AutoUpdatePrefs{Check: false},
 	})
 
@@ -8332,7 +8437,7 @@ func TestOnClientVersionRespectsAutoUpdateCheck(t *testing.T) {
 	}
 
 	// With Check enabled, onClientVersion should broadcast.
-	lb.SetPrefsForTest(&ipn.Prefs{
+	lb.ForTest().SetPrefs(&ipn.Prefs{
 		AutoUpdate: ipn.AutoUpdatePrefs{Check: true},
 	})
 
@@ -8352,7 +8457,7 @@ func TestWatchNotificationsInitialClientVersion(t *testing.T) {
 	}
 
 	// Set Check=true and cache a ClientVersion.
-	lb.SetPrefsForTest(&ipn.Prefs{
+	lb.ForTest().SetPrefs(&ipn.Prefs{
 		AutoUpdate: ipn.AutoUpdatePrefs{Check: true},
 	})
 	lb.mu.Lock()
@@ -8372,7 +8477,7 @@ func TestWatchNotificationsInitialClientVersion(t *testing.T) {
 	nw2.check()
 
 	// Watch with the flag but Check=false, should not include it.
-	lb.SetPrefsForTest(&ipn.Prefs{
+	lb.ForTest().SetPrefs(&ipn.Prefs{
 		AutoUpdate: ipn.AutoUpdatePrefs{Check: false},
 	})
 	nw3 := newNotificationWatcher(t, lb, ipnauth.Self)
@@ -8415,6 +8520,216 @@ func toStrings[T ~string](in []T) []string {
 		out[i] = string(v)
 	}
 	return out
+}
+
+func TestWatchNotificationsInitialPolicy(t *testing.T) {
+	setting.SetDefinitionsForTest(t,
+		setting.NewDefinition(pkey.AdminConsoleVisibility, setting.UserSetting, setting.VisibilityValue),
+	)
+	store := source.NewTestStore(t)
+	rsop.RegisterStoreForTest(t, "TestStore", setting.DeviceScope, store)
+
+	sys := tsd.NewSystem()
+	sys.PolicyClient.Set(testPolicyClient{})
+	lb := newTestLocalBackendWithSys(t, sys)
+
+	nw := newNotificationWatcher(t, lb, &ipnauth.TestActor{})
+	nw.watch(ipn.NotifySysPolicyChanges, []wantedNotification{
+		wantPolicyNotify(),
+	})
+	nw.check()
+
+	nw2 := newNotificationWatcher(t, lb, &ipnauth.TestActor{})
+	nw2.watch(0, nil, unexpectedPolicy)
+	nw2.check()
+}
+
+func TestPolicyChangeNotifiesWatcher(t *testing.T) {
+	setting.SetDefinitionsForTest(t,
+		setting.NewDefinition(pkey.AdminConsoleVisibility, setting.UserSetting, setting.VisibilityValue),
+	)
+	store := source.NewTestStore(t)
+	rsop.RegisterStoreForTest(t, "TestStore", setting.DeviceScope, store)
+
+	sys := tsd.NewSystem()
+	sys.PolicyClient.Set(testPolicyClient{})
+	lb := newTestLocalBackendWithSys(t, sys)
+	if err := lb.Start(ipn.Options{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	nw := newNotificationWatcher(t, lb, &ipnauth.TestActor{})
+	nw.watch(ipn.NotifySysPolicyChanges, []wantedNotification{
+		wantPolicyNotify(),
+		wantPolicyWithSetting(pkey.AdminConsoleVisibility, "hide"),
+	})
+
+	store.SetStrings(source.TestSettingOf(pkey.AdminConsoleVisibility, "hide"))
+
+	nw.check()
+}
+
+func TestPolicyNotifyPerUser(t *testing.T) {
+	store := source.NewTestStore(t)
+	rsop.RegisterStoreForTest(t, "TestStore", setting.DeviceScope, store)
+
+	sys := tsd.NewSystem()
+	sys.PolicyClient.Set(testPolicyClient{})
+	lb := newTestLocalBackendWithSys(t, sys)
+
+	actorA := &ipnauth.TestActor{UID: "S-1-5-21-1001"}
+	actorB := &ipnauth.TestActor{UID: "S-1-5-21-1002"}
+
+	nwA := newNotificationWatcher(t, lb, actorA)
+	nwA.watch(ipn.NotifySysPolicyChanges, []wantedNotification{
+		wantPolicyNotify(),
+	})
+	nwA.check()
+
+	nwB := newNotificationWatcher(t, lb, actorB)
+	nwB.watch(ipn.NotifySysPolicyChanges, []wantedNotification{
+		wantPolicyNotify(),
+	})
+	nwB.check()
+
+	nwNoPolicy := newNotificationWatcher(t, lb, actorA)
+	nwNoPolicy.watch(0, nil, unexpectedPolicy)
+
+	store.SetStrings(source.TestSettingOf(pkey.AdminConsoleVisibility, "hide"))
+
+	nwNoPolicy.check()
+}
+
+func wantPolicyNotify() wantedNotification {
+	return wantedNotification{
+		name: "Policy",
+		cond: func(_ testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+			return n.Policy != nil
+		},
+	}
+}
+
+func wantPolicyWithSetting(key pkey.Key, value string) wantedNotification {
+	return wantedNotification{
+		name: fmt.Sprintf("Policy-%s=%s", key, value),
+		cond: func(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+			if n.Policy == nil {
+				return false
+			}
+			if n.Policy == nil {
+				return false
+			}
+			got := n.Policy.Get(key)
+			if got == nil {
+				return false
+			}
+			if fmt.Sprint(got) != value {
+				t.Errorf("Policy[%s] = %v (%T); want %q", key, got, got, value)
+			}
+			return true
+		},
+	}
+}
+
+func unexpectedPolicy(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+	if n.Policy != nil {
+		t.Errorf("unexpected Policy notification")
+		return true
+	}
+	return false
+}
+
+type testPolicyClient struct {
+	policyclient.NoPolicyClient
+}
+
+func (testPolicyClient) GetPolicySnapshot(uid string) (*policyclient.PolicySnapshot, error) {
+	scope := setting.DefaultScope()
+	if uid != "" {
+		scope = setting.UserScopeOf(uid)
+	}
+	p, err := rsop.PolicyFor(scope)
+	if err != nil {
+		return nil, err
+	}
+	snap := p.Get()
+	log.Printf("GetPolicySnapshot(%q): scope=%v snap=%v", uid, scope, snap)
+	return snap, nil
+}
+
+func (testPolicyClient) RegisterChangeCallback(uid string, cb func(policyclient.PolicyChange)) (func(), error) {
+	scope := setting.DefaultScope()
+	if uid != "" {
+		scope = setting.UserScopeOf(uid)
+	}
+	p, err := rsop.PolicyFor(scope)
+	if err != nil {
+		return func() {}, err
+	}
+	return p.RegisterChangeCallback(func(change policyclient.PolicyChange) {
+		cb(change)
+	}), nil
+}
+
+func TestPolicySnapshotMergesDeviceAndUserScopes(t *testing.T) {
+	setting.SetDefinitionsForTest(t,
+		setting.NewDefinition(pkey.AdminConsoleVisibility, setting.UserSetting, setting.VisibilityValue),
+		setting.NewDefinition(pkey.ExitNodeMenuVisibility, setting.UserSetting, setting.VisibilityValue),
+		setting.NewDefinition(pkey.ManagedByOrganizationName, setting.UserSetting, setting.StringValue),
+	)
+
+	deviceStore := source.NewTestStore(t)
+	deviceStore.SetStrings(
+		source.TestSettingOf(pkey.AdminConsoleVisibility, "hide"),
+		source.TestSettingOf(pkey.ManagedByOrganizationName, "DeviceCorp"),
+	)
+	rsop.RegisterStoreForTest(t, "DeviceStore", setting.DeviceScope, deviceStore)
+
+	uid := "S-1-5-21-1001"
+	userStore := source.NewTestStore(t)
+	userStore.SetStrings(
+		source.TestSettingOf(pkey.AdminConsoleVisibility, "show"),
+		source.TestSettingOf(pkey.ExitNodeMenuVisibility, "hide"),
+	)
+	rsop.RegisterStoreForTest(t, "UserStore", setting.UserScopeOf(uid), userStore)
+
+	sys := tsd.NewSystem()
+	sys.PolicyClient.Set(testPolicyClient{})
+	lb := newTestLocalBackendWithSys(t, sys)
+
+	snap, err := rsop.PolicyFor(setting.UserScopeOf(uid))
+	if err != nil {
+		t.Fatalf("PolicyFor: %v", err)
+	}
+	t.Logf("direct PolicyFor snapshot: %v", snap.Get())
+
+	nw := newNotificationWatcher(t, lb, &ipnauth.TestActor{UID: ipn.WindowsUserID(uid)})
+	nw.watch(ipn.NotifySysPolicyChanges, []wantedNotification{
+		{
+			name: "MergedPolicy",
+			cond: func(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+				if n.Policy == nil {
+					return false
+				}
+
+				// Device scope should win on conflict.
+				if got := fmt.Sprint(n.Policy.Get(pkey.AdminConsoleVisibility)); got != "hide" {
+					t.Errorf("AdminConsole = %v; want hide (device wins)", got)
+				}
+
+				if got := fmt.Sprint(n.Policy.Get(pkey.ExitNodeMenuVisibility)); got != "hide" {
+					t.Errorf("ExitNodesPicker = %v; want hide (from user)", got)
+				}
+
+				if got := fmt.Sprint(n.Policy.Get(pkey.ManagedByOrganizationName)); got != "DeviceCorp" {
+					t.Errorf("ManagedByOrganizationName = %v; want DeviceCorp", got)
+				}
+
+				return true
+			},
+		},
+	})
+	nw.check()
 }
 
 type textUpdate struct {
@@ -8560,72 +8875,65 @@ func TestStripKeysFromPrefs(t *testing.T) {
 func TestRouteAllDisabled(t *testing.T) {
 	pp := netip.MustParsePrefix
 
+	peer := &tailcfg.Node{
+		ID:       1,
+		Key:      key.NewNode().Public(),
+		HomeDERP: 1,
+		Addresses: []netip.Prefix{
+			pp("100.80.207.38/32"),
+		},
+		AllowedIPs: []netip.Prefix{
+			pp("100.80.207.38/32"),
+
+			// If one IP in the Tailscale ULA range is added, the
+			// entire range is added to the router config.
+			pp("fd7a:115c:a1e0::2501:9b83/128"),
+
+			// Other single CGNAT IPs (such as VIP service addresses)
+			// are added individually regardless of RouteAll.
+			pp("100.80.207.56/32"),
+			pp("100.80.207.40/32"),
+			pp("100.94.122.93/32"),
+			pp("100.79.141.115/32"),
+
+			// A /28 is a subnet route, added only with RouteAll.
+			pp("100.64.0.0/28"),
+
+			// Single IPs outside the Tailscale CGNAT/ULA ranges are
+			// subnet routes too.
+			pp("192.168.0.45/32"),
+			pp("fd7a:115c:b1e0::2501:9b83/128"),
+			pp("fdf8:f966:e27c:0:5:0:0:10/128"),
+		},
+	}
+
 	tests := []struct {
-		name          string
-		peers         []wgcfg.Peer
-		wantEndpoints []netip.Prefix
-		routeAll      bool
+		name     string
+		routeAll bool
+		want     []netip.Prefix
 	}{
 		{
 			name:     "route_all_disabled",
 			routeAll: false,
-			peers: []wgcfg.Peer{
-				{
-					AllowedIPs: []netip.Prefix{
-						// if one ip in the Tailscale ULA range is added, the entire range is added to the router config
-						pp("fd7a:115c:a1e0::2501:9b83/128"),
-						pp("100.80.207.38/32"),
-						pp("100.80.207.56/32"),
-						pp("100.80.207.40/32"),
-						pp("100.94.122.93/32"),
-						pp("100.79.141.115/32"),
-
-						// a /28 range will not be added, since this is not a Service IP range (which is always /32, a single IP)
-						pp("100.64.0.0/28"),
-
-						// ips outside the tailscale cgnat/ula range are not added to the router config
-						pp("192.168.0.45/32"),
-						pp("fd7a:115c:b1e0::2501:9b83/128"),
-						pp("fdf8:f966:e27c:0:5:0:0:10/128"),
-					},
-				},
-			},
-			wantEndpoints: []netip.Prefix{
-				pp("100.80.207.38/32"),
-				pp("100.80.207.56/32"),
-				pp("100.80.207.40/32"),
-				pp("100.94.122.93/32"),
+			want: []netip.Prefix{
 				pp("100.79.141.115/32"),
+				pp("100.80.207.38/32"),
+				pp("100.80.207.40/32"),
+				pp("100.80.207.56/32"),
+				pp("100.94.122.93/32"),
 				pp("fd7a:115c:a1e0::/48"),
 			},
 		},
 		{
 			name:     "route_all_enabled",
 			routeAll: true,
-			peers: []wgcfg.Peer{
-				{
-					AllowedIPs: []netip.Prefix{
-						// if one ip in the Tailscale ULA range is added, the entire range is added to the router config
-						pp("fd7a:115c:a1e0::2501:9b83/128"),
-						pp("100.80.207.38/32"),
-						pp("100.80.207.56/32"),
-						pp("100.80.207.40/32"),
-						pp("100.94.122.93/32"),
-						pp("100.79.141.115/32"),
-
-						// ips outside the tailscale cgnat/ula range are not added to the router config
-						pp("192.168.0.45/32"),
-						pp("fd7a:115c:b1e0::2501:9b83/128"),
-						pp("fdf8:f966:e27c:0:5:0:0:10/128"),
-					},
-				},
-			},
-			wantEndpoints: []netip.Prefix{
-				pp("100.80.207.38/32"),
-				pp("100.80.207.56/32"),
-				pp("100.80.207.40/32"),
-				pp("100.94.122.93/32"),
+			want: []netip.Prefix{
+				pp("100.64.0.0/28"),
 				pp("100.79.141.115/32"),
+				pp("100.80.207.38/32"),
+				pp("100.80.207.40/32"),
+				pp("100.80.207.56/32"),
+				pp("100.94.122.93/32"),
 				pp("192.168.0.45/32"),
 				pp("fd7a:115c:a1e0::/48"),
 				pp("fd7a:115c:b1e0::2501:9b83/128"),
@@ -8638,9 +8946,6 @@ func TestRouteAllDisabled(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			prefs := ipn.Prefs{RouteAll: tt.routeAll}
 			lb := newTestLocalBackend(t)
-			cfg := &wgcfg.Config{
-				Peers: tt.peers,
-			}
 			ServiceIPMappings := tailcfg.ServiceIPMappings{
 				"svc:test-service": []netip.Addr{
 					netip.MustParseAddr("100.64.1.2"),
@@ -8658,25 +8963,20 @@ func TestRouteAllDisabled(t *testing.T) {
 						pp("100.64.1.1/32"),
 					},
 					CapMap: tailcfg.NodeCapMap{
-						tailcfg.NodeAttrServiceHost: []tailcfg.RawMessage{
+						nodecap.ServiceHost: []tailcfg.RawMessage{
 							tailcfg.RawMessage(svcIPMapJSON),
 						},
 					},
 				}).View(),
+				Peers: []tailcfg.NodeView{peer.View()},
 			}
+			cn := lb.currentNode()
+			cn.SetNetMap(nm)
+			cn.updateRouteManagerPrefs(routePrefs{RouteAll: tt.routeAll})
 
-			rcfg := lb.routerConfigLocked(cfg, prefs.View(), nm, false)
-			for _, p := range rcfg.Routes {
-				found := false
-				for _, r := range tt.wantEndpoints {
-					if p.Addr() == r.Addr() {
-						found = true
-						break
-					}
-				}
-				if !found {
-					t.Errorf("unexpected prefix %q in router config", p.String())
-				}
+			rcfg := lb.routerConfigLocked(&wgcfg.Config{}, prefs.View(), nm)
+			if !slices.Equal(rcfg.Routes, tt.want) {
+				t.Errorf("Routes = %v; want %v", rcfg.Routes, tt.want)
 			}
 		})
 	}
@@ -8835,7 +9135,7 @@ func TestNoSNATWithAdvertisedExitNodeWarning(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b := newTestLocalBackend(t)
-			b.SetPrefsForTest(tt.prefs)
+			b.ForTest().SetPrefs(tt.prefs)
 			_, hasWarning := b.HealthTracker().CurrentState().Warnings[warnCode]
 			if hasWarning != tt.wantWarning {
 				t.Errorf("warning present = %v, want %v", hasWarning, tt.wantWarning)
@@ -8846,11 +9146,11 @@ func TestNoSNATWithAdvertisedExitNodeWarning(t *testing.T) {
 	// Verify that the warning clears when the conflicting combination is resolved.
 	t.Run("warning-clears-on-fix", func(t *testing.T) {
 		b := newTestLocalBackend(t)
-		b.SetPrefsForTest(&ipn.Prefs{NoSNAT: true, AdvertiseRoutes: exitRoutes})
+		b.ForTest().SetPrefs(&ipn.Prefs{NoSNAT: true, AdvertiseRoutes: exitRoutes})
 		if _, ok := b.HealthTracker().CurrentState().Warnings[warnCode]; !ok {
 			t.Fatal("expected warning to be set")
 		}
-		b.SetPrefsForTest(&ipn.Prefs{NoSNAT: false, AdvertiseRoutes: exitRoutes})
+		b.ForTest().SetPrefs(&ipn.Prefs{NoSNAT: false, AdvertiseRoutes: exitRoutes})
 		if _, ok := b.HealthTracker().CurrentState().Warnings[warnCode]; ok {
 			t.Fatal("expected warning to be cleared after enabling SNAT")
 		}
@@ -8884,7 +9184,7 @@ func TestStartPreservesLoginFlags(t *testing.T) {
 	t.Cleanup(b.Shutdown)
 
 	var cc *mockControl
-	b.SetControlClientGetterForTesting(func(opts controlclient.Options) (controlclient.Client, error) {
+	b.ForTest().SetControlClientGetter(func(opts controlclient.Options) (controlclient.Client, error) {
 		cc = newClient(t, opts)
 		return cc, nil
 	})
@@ -9110,44 +9410,6 @@ func TestShouldUseOneCGNATRoute(t *testing.T) {
 
 }
 
-func TestPeerRoutesCGNATCollapse(t *testing.T) {
-	pp := netip.MustParsePrefix
-
-	// With cgnatThreshold=1 (oneCGNATRoute), adding a peer should not
-	// change the route list. Both collapse to a single 100.64.0.0/10.
-	twoPeers := []wgcfg.Peer{
-		{AllowedIPs: []netip.Prefix{pp("100.64.0.1/32")}},
-		{AllowedIPs: []netip.Prefix{pp("100.64.0.2/32")}},
-	}
-	threePeers := []wgcfg.Peer{
-		{AllowedIPs: []netip.Prefix{pp("100.64.0.1/32")}},
-		{AllowedIPs: []netip.Prefix{pp("100.64.0.2/32")}},
-		{AllowedIPs: []netip.Prefix{pp("100.64.0.3/32")}},
-	}
-
-	routesTwo := peerRoutes(t.Logf, twoPeers, 1, true)
-	routesThree := peerRoutes(t.Logf, threePeers, 1, true)
-
-	wantCGNAT := []netip.Prefix{pp("100.64.0.0/10")}
-	if !reflect.DeepEqual(routesTwo, wantCGNAT) {
-		t.Errorf("two peers: got %v; want %v", routesTwo, wantCGNAT)
-	}
-	if !reflect.DeepEqual(routesThree, wantCGNAT) {
-		t.Errorf("three peers: got %v; want %v", routesThree, wantCGNAT)
-	}
-
-	// Subnet routes must still appear alongside the collapsed CGNAT route.
-	peersWithSubnet := []wgcfg.Peer{
-		{AllowedIPs: []netip.Prefix{pp("100.64.0.1/32")}},
-		{AllowedIPs: []netip.Prefix{pp("100.64.0.2/32"), pp("10.0.0.0/24")}},
-	}
-	got := peerRoutes(t.Logf, peersWithSubnet, 1, true)
-	want := []netip.Prefix{pp("100.64.0.0/10"), pp("10.0.0.0/24")}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("with subnet: got %v; want %v", got, want)
-	}
-}
-
 func TestResetAuthClearsMachineKey(t *testing.T) {
 	store := new(mem.Store)
 
@@ -9275,13 +9537,13 @@ func TestEnginePeerForIPAdjustsForPrefs(t *testing.T) {
 
 	nm := buildNetmapWithPeers(selfNode, exitA, exitB, subnetBig, subnetSmall)
 
-	var eng wgengine.Engine
+	var curLB *LocalBackend
 	var curT *testing.T // active subtest, for test helpers
 
 	wantPeer := func(ip string, n tailcfg.NodeView) {
 		t := curT
 		t.Helper()
-		pip, ok := eng.PeerForIP(netip.MustParseAddr(ip))
+		pip, ok := curLB.PeerForIP(netip.MustParseAddr(ip))
 		if !ok {
 			t.Fatalf("PeerForIP(%s): ok=false, want true", ip)
 		}
@@ -9295,32 +9557,32 @@ func TestEnginePeerForIPAdjustsForPrefs(t *testing.T) {
 	wantNotPeer := func(ip string) {
 		t := curT
 		t.Helper()
-		if _, ok := eng.PeerForIP(netip.MustParseAddr(ip)); ok {
+		if _, ok := curLB.PeerForIP(netip.MustParseAddr(ip)); ok {
 			t.Fatalf("PeerForIP(%s): ok=true, want false", ip)
 		}
 	}
 	wantKey := func(ip string, n tailcfg.NodeView) {
 		t := curT
 		t.Helper()
-		pk, _, ok := eng.PeerKeyForIP(netip.MustParseAddr(ip))
+		pr, ok := curLB.currentNode().routeMgr.Outbound().Lookup(netip.MustParseAddr(ip))
 		if !ok {
-			t.Fatalf("PeerKeyForIP(%s): ok=false, want true", ip)
+			t.Fatalf("routeMgr.Outbound().Lookup(%s): ok=false, want true", ip)
 		}
-		if pk != n.Key() {
-			t.Fatalf("PeerKeyForIP(%s): key=%v, want %v", ip, pk, n.Key())
+		if pr.Key != n.Key() {
+			t.Fatalf("routeMgr.Outbound().Lookup(%s): key=%v, want %v", ip, pr.Key, n.Key())
 		}
 	}
 	wantNotKey := func(ip string) {
 		t := curT
 		t.Helper()
-		if _, _, ok := eng.PeerKeyForIP(netip.MustParseAddr(ip)); ok {
-			t.Fatalf("PeerKeyForIP(%s): ok=true, want false", ip)
+		if _, ok := curLB.currentNode().routeMgr.Outbound().Lookup(netip.MustParseAddr(ip)); ok {
+			t.Fatalf("routeMgr.Outbound().Lookup(%s): ok=true, want false", ip)
 		}
 	}
 	wantSelf := func(ip string) {
 		t := curT
 		t.Helper()
-		pip, ok := eng.PeerForIP(netip.MustParseAddr(ip))
+		pip, ok := curLB.PeerForIP(netip.MustParseAddr(ip))
 		if !ok {
 			t.Fatalf("PeerForIP(%s): ok=false, want true", ip)
 		}
@@ -9449,9 +9711,112 @@ func TestEnginePeerForIPAdjustsForPrefs(t *testing.T) {
 				LoggedIn: true,
 			})
 
-			eng = lb.sys.Engine.Get()
+			curLB = lb
 			curT = t
 			tt.check()
+		})
+	}
+}
+
+// Tests that selecting an exit node that doesn't resolve to any
+// current peer (a nonexistent node, or MDM's "auto:any" placeholder
+// before it is resolved) still installs the blackhole default routes,
+// so internet traffic is dropped rather than escaping to the local
+// network. That behavior is documented on [ipn.Prefs.ExitNodeID] and
+// must survive the migration of OS route computation to
+// net/routemanager.
+func TestRouterConfigExitNodeBlackhole(t *testing.T) {
+	lb := newTestLocalBackend(t)
+	nm := &netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			Name:      "test-node",
+			Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.1.1/32")},
+		}).View(),
+	}
+	cfg := &wgcfg.Config{} // no peer carries the default routes
+
+	hasDefaults := func(routes []netip.Prefix) bool {
+		return slices.Contains(routes, tsaddr.AllIPv4()) && slices.Contains(routes, tsaddr.AllIPv6())
+	}
+	// Push the netmap and prefs into the route manager first, as
+	// authReconfigLocked does before calling routerConfigLocked, now
+	// that the OS routes are derived from the route manager.
+	cn := lb.currentNode()
+	cn.SetNetMap(nm)
+	for _, exitID := range []tailcfg.StableNodeID{"auto:any", "no-such-node"} {
+		prefs := ipn.Prefs{ExitNodeID: exitID}
+		cn.updateRouteManagerPrefs(routePrefs{ExitNodeID: exitID, ExitNodeSelected: true})
+		rcfg := lb.routerConfigLocked(cfg, prefs.View(), nm)
+		if !hasDefaults(rcfg.Routes) {
+			t.Errorf("ExitNodeID=%q: Routes = %v; want blackhole default routes", exitID, rcfg.Routes)
+		}
+	}
+
+	// With no exit node selected, there must be no default routes.
+	cn.updateRouteManagerPrefs(routePrefs{})
+	rcfg := lb.routerConfigLocked(cfg, new(ipn.Prefs).View(), nm)
+	if hasDefaults(rcfg.Routes) {
+		t.Errorf("no exit node: Routes = %v; want no default routes", rcfg.Routes)
+	}
+}
+
+func TestApplyPrefsToHostinfoDedup(t *testing.T) {
+	t.Parallel()
+
+	pfx := netip.MustParsePrefix
+	tests := []struct {
+		name       string
+		routes     []netip.Prefix
+		tags       []string
+		wantRoutes []netip.Prefix
+		wantTags   []string
+	}{
+		{
+			name:       "no_dups",
+			routes:     []netip.Prefix{pfx("10.0.0.0/8"), pfx("192.168.0.0/16")},
+			tags:       []string{"tag:a", "tag:b"},
+			wantRoutes: []netip.Prefix{pfx("10.0.0.0/8"), pfx("192.168.0.0/16")},
+			wantTags:   []string{"tag:a", "tag:b"},
+		},
+		{
+			name:       "dup_routes",
+			routes:     []netip.Prefix{pfx("10.0.0.0/8"), pfx("192.168.0.0/16"), pfx("10.0.0.0/8")},
+			wantRoutes: []netip.Prefix{pfx("10.0.0.0/8"), pfx("192.168.0.0/16")},
+		},
+		{
+			name:     "dup_tags",
+			tags:     []string{"tag:b", "tag:a", "tag:b", "tag:a"},
+			wantTags: []string{"tag:a", "tag:b"},
+		},
+		{
+			name:       "dups_unsorted_input",
+			routes:     []netip.Prefix{pfx("192.168.0.0/16"), pfx("10.0.0.0/8"), pfx("192.168.0.0/16")},
+			tags:       []string{"tag:z", "tag:a", "tag:z"},
+			wantRoutes: []netip.Prefix{pfx("10.0.0.0/8"), pfx("192.168.0.0/16")},
+			wantTags:   []string{"tag:a", "tag:z"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			b := newTestLocalBackend(t)
+			prefs := &ipn.Prefs{
+				AdvertiseRoutes: tt.routes,
+				AdvertiseTags:   tt.tags,
+			}
+
+			var hi tailcfg.Hostinfo
+			b.mu.Lock()
+			b.applyPrefsToHostinfoLocked(&hi, prefs.View())
+			b.mu.Unlock()
+
+			if !slices.Equal(tt.wantRoutes, hi.RoutableIPs) {
+				t.Errorf("RoutableIPs mismatch, got %v; want %v", hi.RoutableIPs, tt.wantRoutes)
+			}
+			if !slices.Equal(tt.wantTags, hi.RequestTags) {
+				t.Errorf("RequestTags mismatch, got %v; want %v", hi.RequestTags, tt.wantTags)
+			}
 		})
 	}
 }

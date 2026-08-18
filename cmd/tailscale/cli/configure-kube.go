@@ -56,7 +56,14 @@ func kubeconfigPath() string {
 	if kubeconfig := os.Getenv("KUBECONFIG"); kubeconfig != "" {
 		var out string
 		for _, out = range filepath.SplitList(kubeconfig) {
-			if info, err := os.Stat(out); !os.IsNotExist(err) && !info.IsDir() {
+			info, err := os.Stat(out)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					break
+				}
+				continue
+			}
+			if !info.IsDir() {
 				break
 			}
 		}
@@ -306,6 +313,11 @@ func nodeOrServiceDNSNameFromArg(st *ipnstate.Status, dns *tailcfg.DNSConfig, ar
 	}
 	ipPrefix := netip.PrefixFrom(ip, ip.BitLen())
 	for _, ps := range st.Peer {
+		if ps.AllowedIPs == nil {
+			// Peer with no addresses visible in the tailnet, e.g. a ProxyGroup
+			// whose backing nodes are offline or not yet approved (#20255).
+			continue
+		}
 		for _, allowedIP := range ps.AllowedIPs.All() {
 			if allowedIP == ipPrefix {
 				return rec.Name, nil

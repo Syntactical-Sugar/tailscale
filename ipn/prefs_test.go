@@ -67,10 +67,10 @@ func TestPrefsEqual(t *testing.T) {
 		"AppConnector",
 		"PostureChecking",
 		"NetfilterKind",
+		"RemoteConfig",
 		"DriveShares",
 		"RelayServerPort",
 		"RelayServerStaticEndpoints",
-		"AllowSingleHosts",
 		"Persist",
 	}
 	if have := fieldsOf(reflect.TypeFor[Prefs]()); !reflect.DeepEqual(have, prefsHandles) {
@@ -525,6 +525,11 @@ func TestPrefsPretty(t *testing.T) {
 			"Prefs{ra=false dns=false want=false shields=true update=off Persist=nil}",
 		},
 		{
+			Prefs{RemoteConfig: true},
+			"windows",
+			"Prefs{ra=false dns=false want=false remoteconfig=true update=off Persist=nil}",
+		},
+		{
 			Prefs{},
 			"windows",
 			"Prefs{ra=false dns=false want=false update=off Persist=nil}",
@@ -714,7 +719,7 @@ func TestMaskedPrefsFields(t *testing.T) {
 	have := map[string]bool{}
 	for _, f := range fieldsOf(reflect.TypeFor[Prefs]()) {
 		switch f {
-		case "Persist", "AllowSingleHosts":
+		case "Persist":
 			// These can't be edited.
 			continue
 		}
@@ -1219,27 +1224,6 @@ func TestNotifyPrefsJSONRoundtrip(t *testing.T) {
 	}
 	if n2.Prefs != nil && n2.Prefs.Valid() {
 		t.Fatal("Prefs should not be valid after deserialization")
-	}
-}
-
-// Verify that our Prefs type writes out an AllowSingleHosts field so we can
-// downgrade to older versions that require it.
-func TestPrefsDowngrade(t *testing.T) {
-	var p Prefs
-	j, err := json.Marshal(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	type oldPrefs struct {
-		AllowSingleHosts bool
-	}
-	var op oldPrefs
-	if err := json.Unmarshal(j, &op); err != nil {
-		t.Fatal(err)
-	}
-	if !op.AllowSingleHosts {
-		t.Fatal("AllowSingleHosts should be true")
 	}
 }
 

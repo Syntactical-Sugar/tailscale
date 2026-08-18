@@ -40,6 +40,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"github.com/tailscale/wireguard-go/tun"
 	"golang.org/x/net/proxy"
 
@@ -52,6 +53,7 @@ import (
 	"tailscale.com/net/netns"
 	"tailscale.com/net/packet"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tstest"
 	"tailscale.com/tstest/deptest"
 	"tailscale.com/tstest/integration"
@@ -344,7 +346,7 @@ func startServer(t *testing.T, ctx context.Context, controlURL, hostname string)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.lb.ConfigureCertsForTest(testCertRoot.getCert)
+	s.lb.ForTest().ConfigureCerts(testCertRoot.getCert)
 
 	// Wait for the server to finish connecting to its home DERP server,
 	// to prevent fast tests from racing the DERP handshake resulting
@@ -819,9 +821,28 @@ func TestFunnel(t *testing.T) {
 	ctx, dialCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer dialCancel()
 
-	controlURL, _ := startControl(t)
+	controlURL, control := startControl(t)
 	s1, _, _ := startServer(t, ctx, controlURL, "s1")
-	s2, _, _ := startServer(t, ctx, controlURL, "s2")
+	s2, s2ip, s2key := startServer(t, ctx, controlURL, "s2")
+
+	// Real Funnel ingress nodes appear in the target node's netmap as
+	// unsigned (UnsignedPeerAPIOnly) peers. Mark s2 the same way and wait
+	// for s1 to see it, so that this test exercises the same peer
+	// capability checks that production Funnel traffic does.
+	control.SetUnsignedPeerAPIOnly(s2key, true)
+	lc1 := must.Get(s1.LocalClient())
+	if err := tstest.WaitFor(10*time.Second, func() error {
+		res, err := lc1.WhoIs(ctx, s2ip.String())
+		if err != nil {
+			return err
+		}
+		if !res.Node.UnsignedPeerAPIOnly {
+			return errors.New("s1 does not yet see s2 as UnsignedPeerAPIOnly")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	ln := must.Get(s1.ListenFunnel("tcp", ":443"))
 	defer ln.Close()
@@ -991,17 +1012,17 @@ func setUpServiceState(t *testing.T, name, ip string, host, client *Server,
 	// is a mapping from the Service name to the Service VIP.
 	cm := host.lb.NetMap().SelfNode.CapMap()
 	svcIPMap := make(tailcfg.ServiceIPMappings)
-	if cm.Contains(tailcfg.NodeAttrServiceHost) {
-		parsed := must.Get(tailcfg.UnmarshalNodeCapViewJSON[tailcfg.ServiceIPMappings](cm, tailcfg.NodeAttrServiceHost))
+	if cm.Contains(nodecap.ServiceHost) {
+		parsed := must.Get(tailcfg.UnmarshalNodeCapViewJSON[tailcfg.ServiceIPMappings](cm, nodecap.ServiceHost))
 		if len(parsed) != 1 {
-			t.Fatalf("expected only one capability for %v, got %d", tailcfg.NodeAttrServiceHost, len(parsed))
+			t.Fatalf("expected only one capability for %v, got %d", nodecap.ServiceHost, len(parsed))
 		}
 		svcIPMap = parsed[0]
 	}
 	svcIPMap[serviceName] = []netip.Addr{netip.MustParseAddr(ip)}
 	svcIPMapJSON := must.Get(json.Marshal(svcIPMap))
 	newCM := cm.AsMap()
-	mak.Set(&newCM, tailcfg.NodeAttrServiceHost, []tailcfg.RawMessage{tailcfg.RawMessage(svcIPMapJSON)})
+	mak.Set(&newCM, nodecap.ServiceHost, []tailcfg.RawMessage{tailcfg.RawMessage(svcIPMapJSON)})
 	control.SetNodeCapMap(host.lb.NodeKey(), newCM)
 
 	// The Service host must be allowed to advertise the Service VIP.
@@ -1745,7 +1766,7 @@ func TestFallbackTCPHandler(t *testing.T) {
 // Before aa5da2e5f22a, every peer change rebuilt a full netmap on
 // the engine, so [wgengine.Engine.SetNetworkMap] kept the engine's
 // cached netmap fresh and [wgengine.Engine.Reconfig] kept wgdev and
-// e.lastCfgFull fresh. After that refactor, peer adds and removes
+// e.lastCfg fresh. After that refactor, peer adds and removes
 // ride the delta path and only mutate [nodeBackend]; the engine's
 // cached netmap and wireguard config stayed stale, and
 // [wgengine.Engine.PeerForIP] / [wgengine.Engine.Ping] / wgdev's
@@ -1924,7 +1945,7 @@ func TestPingSubnetRouteOfDeltaPeer(t *testing.T) {
 	// outbound wgdev encryption, magicsock transport. The receiving
 	// side (s2's tstun.Wrapper) intercepts TSMP regardless of dst
 	// IP and replies with a pong. So this catches both halves of
-	// the bug: a stale BART / lastCfgFull (PeerForIP / lookupPeerByIP
+	// the bug: a stale BART / lastCfg (PeerForIP / lookupPeerByIP
 	// miss) AND a stale wgdev PeerLookupFunc closure (peer's noise
 	// key not yet registered for outbound encryption).
 	pingCtx, cancelPing := pingTimeout(ctx)
@@ -2157,7 +2178,11 @@ func TestUDPConn(t *testing.T) {
 func parseMetrics(m []byte) (map[string]float64, error) {
 	metrics := make(map[string]float64)
 
-	var parser expfmt.TextParser
+	// prometheus/common v0.67 made the validation scheme mandatory;
+	// the zero-value parser now panics. LegacyValidation matches the
+	// classic ASCII metric/label name rules that the tailscaled exporter
+	// uses (e.g. tailscaled_inbound_bytes_total).
+	parser := expfmt.NewTextParser(model.LegacyValidation)
 	mf, err := parser.TextToMetricFamilies(bytes.NewReader(m))
 	if err != nil {
 		return nil, err
@@ -2555,6 +2580,10 @@ type chanTUN struct {
 	Outbound chan []byte // packets to read from TUN
 	closed   chan struct{}
 	events   chan tun.Event
+
+	// wmu serializes Write and Close so a Write can't send on
+	// Inbound while Close is closing it.
+	wmu sync.Mutex
 }
 
 func newChanTUN() *chanTUN {
@@ -2571,6 +2600,8 @@ func newChanTUN() *chanTUN {
 func (t *chanTUN) File() *os.File { panic("not implemented") }
 
 func (t *chanTUN) Close() error {
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
 	select {
 	case <-t.closed:
 	default:
@@ -2591,14 +2622,19 @@ func (t *chanTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 }
 
 func (t *chanTUN) Write(bufs [][]byte, offset int) (int, error) {
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	select {
+	case <-t.closed:
+		return 0, errors.New("closed")
+	default:
+	}
 	for _, buf := range bufs {
 		pkt := buf[offset:]
 		if len(pkt) == 0 {
 			continue
 		}
 		select {
-		case <-t.closed:
-			return 0, errors.New("closed")
 		case t.Inbound <- slices.Clone(pkt):
 		default:
 			// Drop the packet if the channel is full, like a real
@@ -2688,7 +2724,7 @@ func setupTwoClientTest(t *testing.T, useTUN bool) *listenTest {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s2.lb.ConfigureCertsForTest(testCertRoot.getCert)
+	s2.lb.ForTest().ConfigureCerts(testCertRoot.getCert)
 
 	s1ip4, s1ip6 := s1.TailscaleIPs()
 	s2ip4 := s2status.TailscaleIPs[0]
@@ -3258,7 +3294,7 @@ func TestDialUDPInjectedReadRecordsFlowState(t *testing.T) {
 		// PacketFilter-only changes don't necessarily fire peer/netmap
 		// notifications, so poll the wgengine filter directly.
 		if err := tstest.WaitFor(30*time.Second, func() error {
-			f := lt.s2.lb.GetFilterForTest()
+			f := lt.s2.lb.ForTest().GetFilter()
 			if f == nil {
 				return errors.New("no filter yet")
 			}
@@ -3404,6 +3440,11 @@ func TestDeps(t *testing.T) {
 		BadDeps: map[string]string{
 			"golang.org/x/crypto/ssh":                       "tsnet should not depend on SSH",
 			"golang.org/x/crypto/ssh/internal/bcrypt_pbkdf": "tsnet should not depend on SSH",
+			"tailscale.com/chirp":                           "tsnet should not depend on BIRD integration",
+			"tailscale.com/feature/bird":                    "tsnet should not depend on BIRD integration",
+			"tailscale.com/feature/captiveportal":           "tsnet apps don't need captive portal detection; import it explicitly if desired",
+			"tailscale.com/feature/clientupdate":            "tsnet should not depend on feature/clientupdate",
+			"tailscale.com/feature/remoteconfig":            "tsnet should not depend on feature/remoteconfig",
 			"tailscale.com/feature/syspolicy":               "tsnet should not depend on syspolicy",
 			"tailscale.com/ipn/store/awsstore":              "tsnet callers wanting AWS state storage should import awsstore themselves",
 			"tailscale.com/ipn/store/kubestore":             "tsnet callers wanting Kubernetes state storage should import kubestore themselves",
@@ -3429,8 +3470,8 @@ func TestResolveAuthKey(t *testing.T) {
 		audience        string
 		oauthAvailable  bool
 		wifAvailable    bool
-		resolveViaOAuth func(ctx context.Context, clientSecret string, tags []string) (string, error)
-		resolveViaWIF   func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error)
+		resolveViaOAuth func(ctx context.Context, args tailscale.ResolveAuthKeyArgs) (string, error)
+		resolveViaWIF   func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error)
 		wantAuthKey     string
 		wantErr         bool
 		wantErrContains string
@@ -3439,9 +3480,9 @@ func TestResolveAuthKey(t *testing.T) {
 			name:           "success-oauth-client-secret",
 			clientSecret:   "tskey-client-secret-123",
 			oauthAvailable: true,
-			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
-				if clientSecret != "tskey-client-secret-123" {
-					return "", fmt.Errorf("unexpected client secret: %s", clientSecret)
+			resolveViaOAuth: func(ctx context.Context, args tailscale.ResolveAuthKeyArgs) (string, error) {
+				if args.AuthKey != "tskey-client-secret-123" {
+					return "", fmt.Errorf("unexpected client secret: %s", args.AuthKey)
 				}
 				return "tskey-auth-via-oauth", nil
 			},
@@ -3452,7 +3493,7 @@ func TestResolveAuthKey(t *testing.T) {
 			name:           "fail-oauth-client-secret",
 			clientSecret:   "tskey-client-secret-123",
 			oauthAvailable: true,
-			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
+			resolveViaOAuth: func(ctx context.Context, args tailscale.ResolveAuthKeyArgs) (string, error) {
 				return "", fmt.Errorf("resolution failed")
 			},
 			wantErrContains: "resolution failed",
@@ -3462,12 +3503,12 @@ func TestResolveAuthKey(t *testing.T) {
 			clientID:     "client-id-123",
 			idToken:      "id-token-456",
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
-				if clientID != "client-id-123" {
-					return "", fmt.Errorf("unexpected client ID: %s", clientID)
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
+				if args.ClientID != "client-id-123" {
+					return "", fmt.Errorf("unexpected client ID: %s", args.ClientID)
 				}
-				if idToken != "id-token-456" {
-					return "", fmt.Errorf("unexpected ID token: %s", idToken)
+				if args.IDToken != "id-token-456" {
+					return "", fmt.Errorf("unexpected ID token: %s", args.IDToken)
 				}
 				return "tskey-auth-via-wif", nil
 			},
@@ -3479,12 +3520,12 @@ func TestResolveAuthKey(t *testing.T) {
 			clientID:     "client-id-123",
 			audience:     "api.tailscale.com",
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
-				if clientID != "client-id-123" {
-					return "", fmt.Errorf("unexpected client ID: %s", clientID)
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
+				if args.ClientID != "client-id-123" {
+					return "", fmt.Errorf("unexpected client ID: %s", args.ClientID)
 				}
-				if audience != "api.tailscale.com" {
-					return "", fmt.Errorf("unexpected ID token: %s", idToken)
+				if args.Audience != "api.tailscale.com" {
+					return "", fmt.Errorf("unexpected audience: %s", args.Audience)
 				}
 				return "tskey-auth-via-wif", nil
 			},
@@ -3496,7 +3537,7 @@ func TestResolveAuthKey(t *testing.T) {
 			clientID:     "client-id-123",
 			idToken:      "id-token-456",
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
 				return "", fmt.Errorf("resolution failed")
 			},
 			wantErrContains: "resolution failed",
@@ -3506,7 +3547,7 @@ func TestResolveAuthKey(t *testing.T) {
 			clientID:     "",
 			idToken:      "id-token-456",
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
 				return "", fmt.Errorf("should not be called")
 			},
 			wantErrContains: "empty",
@@ -3516,7 +3557,7 @@ func TestResolveAuthKey(t *testing.T) {
 			clientID:     "",
 			audience:     "api.tailscale.com",
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
 				return "", fmt.Errorf("should not be called")
 			},
 			wantErrContains: "empty",
@@ -3526,7 +3567,7 @@ func TestResolveAuthKey(t *testing.T) {
 			clientID:     "client-id-123",
 			idToken:      "",
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
 				return "", fmt.Errorf("should not be called")
 			},
 			wantErrContains: "empty",
@@ -3537,7 +3578,7 @@ func TestResolveAuthKey(t *testing.T) {
 			idToken:      "id-token-456",
 			audience:     "api.tailscale.com",
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
 				return "", fmt.Errorf("should not be called")
 			},
 			wantErrContains: "only one of ID token and audience",
@@ -3546,14 +3587,14 @@ func TestResolveAuthKey(t *testing.T) {
 			name:           "wif-skipped-oauth-succeeds",
 			clientSecret:   "tskey-client-secret-123",
 			oauthAvailable: true,
-			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
-				if clientSecret != "tskey-client-secret-123" {
-					return "", fmt.Errorf("unexpected client secret: %s", clientSecret)
+			resolveViaOAuth: func(ctx context.Context, args tailscale.ResolveAuthKeyArgs) (string, error) {
+				if args.AuthKey != "tskey-client-secret-123" {
+					return "", fmt.Errorf("unexpected client secret: %s", args.AuthKey)
 				}
 				return "tskey-auth-via-oauth", nil
 			},
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
 				return "", fmt.Errorf("should not be called")
 			},
 			wantAuthKey:     "tskey-auth-via-oauth",
@@ -3564,11 +3605,11 @@ func TestResolveAuthKey(t *testing.T) {
 			clientID:       "tskey-client-id-123",
 			idToken:        "",
 			oauthAvailable: true,
-			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
+			resolveViaOAuth: func(ctx context.Context, args tailscale.ResolveAuthKeyArgs) (string, error) {
 				return "", fmt.Errorf("resolution failed")
 			},
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
 				return "", fmt.Errorf("should not be called")
 			},
 			wantErrContains: "failed",
@@ -3592,9 +3633,9 @@ func TestResolveAuthKey(t *testing.T) {
 			name:           "authkey-client-secret-oauth-succeeds",
 			authKey:        "tskey-client-secret-123",
 			oauthAvailable: true,
-			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
-				if clientSecret != "tskey-client-secret-123" {
-					return "", fmt.Errorf("unexpected client secret: %s", clientSecret)
+			resolveViaOAuth: func(ctx context.Context, args tailscale.ResolveAuthKeyArgs) (string, error) {
+				if args.AuthKey != "tskey-client-secret-123" {
+					return "", fmt.Errorf("unexpected client secret: %s", args.AuthKey)
 				}
 				return "tskey-auth-via-oauth", nil
 			},
@@ -3605,7 +3646,7 @@ func TestResolveAuthKey(t *testing.T) {
 			name:           "authkey-client-secret-oauth-fails",
 			authKey:        "tskey-client-secret-123",
 			oauthAvailable: true,
-			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
+			resolveViaOAuth: func(ctx context.Context, args tailscale.ResolveAuthKeyArgs) (string, error) {
 				return "", fmt.Errorf("resolution failed")
 			},
 			wantErrContains: "resolution failed",
@@ -3883,133 +3924,4 @@ func TestListenMultipleEphemeralPorts(t *testing.T) {
 		lt := setupTwoClientTest(t, true)
 		testMultipleEphemeral(t, lt)
 	})
-}
-
-// TestKeyExtensionAfterRestart verifies that a tsnet client with an expired node key
-// that has launched into an interactive login after a restart recovers when the old
-// key gets extended.
-//
-// See https://github.com/tailscale/tailscale/issues/19326.
-func TestKeyExtensionAfterRestart(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-
-	controlURL, control := startControl(t)
-	control.RequireAuth = true
-
-	tmp := filepath.Join(t.TempDir(), "s1")
-	os.MkdirAll(tmp, 0755)
-
-	newServer := func() *Server {
-		s := &Server{
-			Dir:        tmp,
-			ControlURL: controlURL,
-			Hostname:   "s1",
-			Logf:       tstest.WhileTestRunningLogger(t),
-		}
-		t.Cleanup(func() { s.Close() })
-		return s
-	}
-
-	// Start a node as tsnet instance s1.
-	s1 := newServer()
-	if err := s1.Start(); err != nil {
-		t.Fatalf("s1.Start: %v", err)
-	}
-	upErrCh := make(chan error, 1)
-	go func() { _, err := s1.Up(ctx); upErrCh <- err }()
-
-	var initialAuthURL string
-	if err := tstest.WaitFor(20*time.Second, func() error {
-		url := s1.lb.StatusWithoutPeers().AuthURL
-		if url == "" {
-			return errors.New("no AuthURL yet")
-		}
-		initialAuthURL = url
-		return nil
-	}); err != nil {
-		t.Fatalf("waiting for initial AuthURL: %v", err)
-	}
-	if !control.CompleteAuth(initialAuthURL) {
-		t.Fatal("failed to complete initial AuthURL")
-	}
-	select {
-	case err := <-upErrCh:
-		if err != nil {
-			t.Fatalf("s1.Up: %v", err)
-		}
-	case <-time.After(20 * time.Second):
-		t.Fatalf("timed out waiting for s1.Up to return, s1.lb.State()=%v", s1.lb.State())
-	}
-
-	nodePub := s1.lb.StatusWithoutPeers().Self.PublicKey
-
-	// Expire s1's node key.
-	serverNode := control.Node(nodePub)
-	if serverNode == nil {
-		t.Fatalf("node %v not in control", nodePub)
-	}
-	serverNode.KeyExpiry = time.Now().Add(-time.Minute)
-	control.UpdateNode(serverNode)
-
-	// Wait for s1 to transition away from the Running state.
-	if err := tstest.WaitFor(20*time.Second, func() error {
-		if got := s1.lb.State(); got == ipn.Running {
-			return errors.New("still Running")
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("waiting to transition away from Running: %v", err)
-	}
-
-	if err := s1.Close(); err != nil {
-		t.Fatalf("s1.Close: %v", err)
-	}
-
-	// Restart the node as tsnet instance s2.
-	s2 := newServer()
-	if err := s2.Start(); err != nil {
-		t.Fatalf("s2.Start: %v", err)
-	}
-	s2UpErrCh := make(chan error, 1)
-	go func() { _, err := s2.Up(ctx); s2UpErrCh <- err }()
-
-	// Wait for s2 to transition into the NeedsLogin state.
-	var secondAuthURL string
-	if err := tstest.WaitFor(20*time.Second, func() error {
-		u := s2.lb.StatusWithoutPeers().AuthURL
-		if u == "" {
-			return errors.New("no AuthURL yet")
-		}
-		secondAuthURL = u
-		return nil
-	}); err != nil {
-		t.Fatalf("waiting for s2 AuthURL: %v", err)
-	}
-	// We deliberately do not complete the auth.
-	_ = secondAuthURL
-
-	// Extend the old node key.
-	serverNode.KeyExpiry = time.Now().Add(24 * time.Hour)
-	control.UpdateNode(serverNode)
-
-	// Wait for s2 to receive the netmap with the key extension info
-	// and transition to Running.
-	if err := tstest.WaitFor(20*time.Second, func() error {
-		if got := s2.lb.State(); got != ipn.Running {
-			return fmt.Errorf("in state %v; want Running", got)
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("waiting to return to Running after key extension: %v", err)
-	}
-
-	select {
-	case err := <-s2UpErrCh:
-		if err != nil {
-			t.Fatalf("s2.Up: %v", err)
-		}
-	case <-time.After(20 * time.Second):
-		t.Fatalf("timed out waiting for s2.Up to return, s2.lb.State()=%v", s2.lb.State())
-	}
 }

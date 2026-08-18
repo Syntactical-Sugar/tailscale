@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tka"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
@@ -137,7 +138,7 @@ type TailnetLockStatus struct {
 	TrustedKeys []TKAKey
 
 	// VisiblePeers describes peers which are visible in the netmap that
-	// have valid Tailnet Lock signatures signatures.
+	// have valid Tailnet Lock signatures.
 	VisiblePeers []*TKAPeer
 
 	// FilteredPeers describes peers which were removed from the netmap
@@ -302,7 +303,7 @@ type PeerStatus struct {
 	// Deprecated: use CapMap instead. See https://github.com/tailscale/tailscale/issues/11508
 	// Every value is Capabilities is also a key in CapMap, even if it
 	// has no values in that map.
-	Capabilities []tailcfg.NodeCapability `json:",omitempty"`
+	Capabilities []nodecap.Cap `json:",omitempty"`
 
 	// CapMap is a map of capabilities to their values.
 	CapMap tailcfg.NodeCapMap `json:",omitempty"`
@@ -356,8 +357,26 @@ const (
 )
 
 // HasCap reports whether ps has the given capability.
-func (ps *PeerStatus) HasCap(cap tailcfg.NodeCapability) bool {
+func (ps *PeerStatus) HasCap(cap nodecap.Cap) bool {
 	return ps.CapMap.Contains(cap)
+}
+
+// IsRouter reports whether ps describes a router:
+// a node that routes addresses besides its own.
+// Examples: an exit node, a subnet router, an app connector, etc.
+// It is the analogue of [tailcfg.Node.IsRouter].
+func (ps *PeerStatus) IsRouter() bool {
+	// TODO(sfllaw): Keep this aligned with dbx.Node.IsSubnetRouter.
+	if ps.AllowedIPs == nil {
+		return false
+	}
+
+	for _, r := range ps.AllowedIPs.All() {
+		if !r.IsSingleIP() || !slices.Contains(ps.TailscaleIPs, r.Addr()) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsTagged reports whether ps is tagged.

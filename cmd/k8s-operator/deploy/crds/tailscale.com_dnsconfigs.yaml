@@ -977,6 +977,27 @@ spec:
                                           Empty topologyKey is not allowed.
                                         type: string
                                   x-kubernetes-list-type: atomic
+                        imagePullSecrets:
+                          description: |-
+                            Nameserver Pod's image pull Secrets.
+                            https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#PodSpec
+                          type: array
+                          items:
+                            description: |-
+                              LocalObjectReference contains enough information to let you locate the
+                              referenced object inside the same namespace.
+                            type: object
+                            properties:
+                              name:
+                                description: |-
+                                  Name of the referent.
+                                  This field is effectively required, but due to backwards compatibility is
+                                  allowed to be empty. Instances of this type with an empty value here are
+                                  almost certainly wrong.
+                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                type: string
+                                default: ""
+                            x-kubernetes-map-type: atomic
                         nodeSelector:
                           description: If specified, applies node selector rules to the pods deployed by the DNSConfig resource.
                           type: object
@@ -1004,9 +1025,10 @@ spec:
                               operator:
                                 description: |-
                                   Operator represents a key's relationship to the value.
-                                  Valid operators are Exists and Equal. Defaults to Equal.
+                                  Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
                                   Exists is equivalent to wildcard for value, so that a pod can
                                   tolerate all taints of a particular category.
+                                  Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
                                 type: string
                               tolerationSeconds:
                                 description: |-

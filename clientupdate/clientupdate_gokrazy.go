@@ -15,8 +15,11 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
+	"tailscale.com/clientupdate/distsign"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/progresstracking"
 )
 
 const (
@@ -40,38 +43,24 @@ func gokrazyUpdateFromURL(ctx context.Context, args GokrazyUpdateArgs) error {
 	if logf == nil {
 		logf = logger.Discard
 	}
-	if !args.AllowUnsigned {
-		return fmt.Errorf("signed GAF verification is not implemented yet; see https://github.com/tailscale/tailscale/issues/20002")
-	}
 
 	tmp, err := os.CreateTemp("", "tailscale-gokrazy-*.gaf")
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
+	tmp.Close()
 	defer os.Remove(tmpName)
 
-	req, err := http.NewRequestWithContext(ctx, "GET", args.URL, nil)
-	if err != nil {
-		tmp.Close()
-		return err
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		tmp.Close()
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		tmp.Close()
-		return fmt.Errorf("download GAF: %s", res.Status)
-	}
-	if _, err := io.Copy(tmp, res.Body); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
+	logf("downloading %s", args.URL)
+	if args.AllowUnsigned {
+		if err := downloadUnverified(ctx, logf, args.URL, tmpName); err != nil {
+			return err
+		}
+	} else {
+		if err := distsign.DownloadVerified(ctx, logf, args.URL, tmpName); err != nil {
+			return err
+		}
 	}
 
 	zr, err := zip.OpenReader(tmpName)
@@ -79,6 +68,8 @@ func gokrazyUpdateFromURL(ctx context.Context, args GokrazyUpdateArgs) error {
 		return err
 	}
 	defer zr.Close()
+
+	logf("download complete")
 
 	gokClient := gokrazyHTTPClient()
 	for _, part := range []struct {
@@ -89,6 +80,7 @@ func gokrazyUpdateFromURL(ctx context.Context, args GokrazyUpdateArgs) error {
 		{"boot.img", "/update/boot"},
 		{"mbr.img", "/update/mbr"},
 	} {
+		logf("writing %s...", part.name)
 		if err := putGokrazyGAFMember(ctx, gokClient, zr.File, part.name, part.path); err != nil {
 			return err
 		}
@@ -103,6 +95,76 @@ func gokrazyUpdateFromURL(ctx context.Context, args GokrazyUpdateArgs) error {
 	}
 	logf("reboot requested")
 	return nil
+}
+
+// downloadUnverified saves the GAF at srcURL to dstPath without verifying
+// a signature. It is used only when args.AllowUnsigned is set, for tests
+// that serve the GAF from a fileserver that does not publish distsign.pub
+// and for the gafpush "sftp the GAF onto the appliance and update from a
+// local path" flow, which uses a "file://" URL.
+func downloadUnverified(ctx context.Context, logf logger.Logf, srcURL, dstPath string) error {
+	if after, ok := strings.CutPrefix(srcURL, "file://"); ok {
+		return copyLocalFile(after, dstPath, logf)
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", srcURL, nil)
+	if err != nil {
+		return err
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("download GAF: %s", res.Status)
+	}
+	f, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	total := res.ContentLength
+	pw := progresstracking.NewWriter(io.Discard, total, time.Second, func(done int64) {
+		if total > 0 {
+			logf("downloading: %d / %d MB (%.0f%%)", done>>20, total>>20, float64(done)/float64(total)*100)
+		}
+	})
+	if _, err := io.Copy(f, io.TeeReader(res.Body, pw)); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// copyLocalFile copies the GAF at src to dst. Used by the "file://" branch
+// of downloadUnverified. The source file is left in place; callers that
+// staged it (e.g. gafpush) clean up after the update completes.
+func copyLocalFile(src, dst string, logf logger.Logf) error {
+	sf, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sf.Close()
+	df, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	fi, err := sf.Stat()
+	if err != nil {
+		df.Close()
+		return err
+	}
+	total := fi.Size()
+	logf("copying local GAF %s (%d MB)", src, total>>20)
+	pw := progresstracking.NewWriter(io.Discard, total, time.Second, func(done int64) {
+		if total > 0 {
+			logf("copying: %d / %d MB (%.0f%%)", done>>20, total>>20, float64(done)/float64(total)*100)
+		}
+	})
+	if _, err := io.Copy(df, io.TeeReader(sf, pw)); err != nil {
+		df.Close()
+		return err
+	}
+	return df.Close()
 }
 
 func gokrazyHTTPClient() *http.Client {

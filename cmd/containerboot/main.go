@@ -139,6 +139,7 @@ import (
 	"github.com/benbjohnson/immutable"
 	"golang.org/x/sys/unix"
 
+	"tailscale.com/client/local"
 	"tailscale.com/health"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
@@ -153,19 +154,20 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/views"
 	"tailscale.com/util/deephash"
+	"tailscale.com/util/def"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/linuxfw"
 )
 
 func newNetfilterRunner(logf logger.Logf) (linuxfw.NetfilterRunner, error) {
-	if defaultBool("TS_TEST_FAKE_NETFILTER", false) {
+	if def.Bool(os.Getenv("TS_TEST_FAKE_NETFILTER"), false) {
 		return linuxfw.NewFakeIPTablesRunner(), nil
 	}
 	return linuxfw.New(logf, "")
 }
 
 func getAutoAdvertiseBool() bool {
-	return defaultBool("TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT", true)
+	return def.Bool(os.Getenv("TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT"), true)
 }
 
 const containerbootWatchMask = ipn.NotifyInitialStatus |
@@ -207,6 +209,23 @@ func (s netmapState) updateFromNotify(n ipn.Notify) netmapState {
 	for _, id := range n.PeersRemoved {
 		if s.peersByID != nil {
 			s.peersByID = s.peersByID.Delete(id)
+		}
+	}
+	return s
+}
+
+// processNotify updates the netmap state from an IPN bus Notify. On
+// SelfChange it also refetches DNS via the LocalAPI dns-config
+// endpoint; the bus carries no DNS delta.
+func (s netmapState) processNotify(ctx context.Context, client *local.Client, n ipn.Notify) netmapState {
+	s = s.updateFromNotify(n)
+	if n.SelfChange != nil {
+		dns, err := client.DNSConfig(ctx)
+		if err != nil {
+			log.Printf("error refreshing DNS config from tailscaled: %v", err)
+		} else if dns != nil {
+			s.dnsExtraRecords = views.SliceOf(dns.ExtraRecords)
+			s.certDomains = views.SliceOf(dns.CertDomains)
 		}
 	}
 	return s
@@ -405,7 +424,7 @@ func run() error {
 		mux := http.NewServeMux()
 
 		log.Printf("Running healthcheck endpoint at %s/healthz", cfg.HealthCheckAddrPort)
-		healthCheck = healthz.RegisterHealthHandlers(mux, cfg.PodIPv4, log.Printf)
+		healthCheck = healthz.RegisterHealthHandlers(mux, cfg.PodIPv4, cfg.PodIPv6, log.Printf)
 
 		close := runHTTPServer(mux, cfg.HealthCheckAddrPort)
 		defer close()
@@ -421,7 +440,7 @@ func run() error {
 
 		if cfg.localHealthEnabled() {
 			log.Printf("Running healthcheck endpoint at %s/healthz", cfg.LocalAddrPort)
-			healthCheck = healthz.RegisterHealthHandlers(mux, cfg.PodIPv4, log.Printf)
+			healthCheck = healthz.RegisterHealthHandlers(mux, cfg.PodIPv4, cfg.PodIPv6, log.Printf)
 		}
 
 		if cfg.egressSvcsTerminateEPEnabled() {
@@ -703,7 +722,7 @@ runLoop:
 		case err := <-cfgWatchErrChan:
 			return fmt.Errorf("failed to watch tailscaled config: %w", err)
 		case n := <-notifyChan:
-			nmState = nmState.updateFromNotify(n)
+			nmState = nmState.processNotify(ctx, client, n)
 			if state, ok := notifyState(n); ok && state != ipn.Running {
 				// Something's gone wrong and we've left the authenticated state.
 				// Our container image never recovered gracefully from this, and the
@@ -930,6 +949,7 @@ runLoop:
 						stateSecret:  cfg.KubeSecret,
 						netmapChan:   egressSvcsNotify,
 						podIPv4:      cfg.PodIPv4,
+						podIPv6:      cfg.PodIPv6,
 						tailnetAddrs: addrs,
 					}
 					go func() {

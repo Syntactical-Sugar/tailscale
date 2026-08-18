@@ -198,6 +198,9 @@ func main() {
 		if r.URL.Query().Get("accept-routes") == "true" {
 			args = append(args, "--accept-routes")
 		}
+		if r.URL.Query().Get("ssh") == "true" {
+			args = append(args, "--ssh")
+		}
 		serveCmd(w, "tailscale", args...)
 	})
 	ttaMux.HandleFunc("/set", func(w http.ResponseWriter, r *http.Request) {
@@ -366,6 +369,9 @@ func main() {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		if cookie := r.Header.Get("Cookie"); cookie != "" {
+			req.Header.Set("Cookie", cookie)
+		}
 		// Use Tailscale's SOCKS5 proxy if available, so traffic to Tailscale
 		// subnet routes goes through the WireGuard tunnel instead of the
 		// host network stack (which may not have the routes, especially
@@ -397,6 +403,9 @@ func main() {
 			return
 		}
 		defer resp.Body.Close()
+		for _, sc := range resp.Header.Values("Set-Cookie") {
+			w.Header().Add("Set-Cookie", sc)
+		}
 		w.Header().Set("X-Upstream-Status", strconv.Itoa(resp.StatusCode))
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)

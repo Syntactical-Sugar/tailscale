@@ -102,15 +102,15 @@ jobs:
         # single-test-per-matrix-job model. They stay runnable locally.
         run: |
           set -euo pipefail
-          exclude='^(TestGrid)$'
+          exclude='^(TestGrid|TestVnetPerf.*)$'
           tmp=$(mktemp)
           for pkg_dir in tstest/natlab/vmtest tstest/integration/nat; do
             pkg="./${pkg_dir}/"
             for f in "${pkg_dir}"/*_test.go; do
               [ -e "$f" ] || continue
-              grep -hE '^func Test[A-Z][A-Za-z0-9_]*\(t \*testing\.T\)' "$f" \
+              { grep -hE '^func Test[A-Z][A-Za-z0-9_]*\(t \*testing\.T\)' "$f" || true; } \
                 | sed -E 's/^func (Test[A-Za-z0-9_]+).*/\1/' \
-                | grep -vE "$exclude" \
+                | { grep -vE "$exclude" || true; } \
                 | while read -r t; do
                     jq -nc --arg pkg "$pkg" --arg test "$t" \
                       '{pkg: $pkg, test: $test}' >> "$tmp"
@@ -165,13 +165,13 @@ jobs:
           key: natlab-gokrazy-${{ github.sha }}
 
       # The gokrazy-based tests boot the kernel directly from
-      # vmlinuz that ships in the tailscale/gokrazy-kernel module.
+      # vmlinuz that ships in the gokrazy/kernel.amd64 module.
       # Tests look it up under GOMODCACHE via findKernelPath, so the
       # module has to be present even though no Go source imports it
       # in the test package itself.
-      - name: Download gokrazy-kernel module
+      - name: Download kernel.amd64 module
         run: |
-          ./tool/go mod download github.com/tailscale/gokrazy-kernel
+          ./tool/go mod download github.com/gokrazy/kernel.amd64
 
       - name: Run ${{ matrix.test }}
         # Per-test timeout is well above the few-minute typical runtime
